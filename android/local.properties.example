@@ -1,0 +1,8 @@
+# Example keys only. Flutter/Android tools create the real android/local.properties.
+# Never commit credentials or signing material.
+DEEPSEEK_KEY=
+MINIMAX_KEY=
+TENCENT_SECRET_ID=
+TENCENT_SECRET_KEY=
+BAILIAN_WORKSPACE_ID=
+BAILIAN_API_KEY=
