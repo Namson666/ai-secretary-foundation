@@ -93,9 +93,23 @@ class SqliteRagVectorIndex implements RagVectorIndex {
     int limit = 8,
     double minScore = 0.18,
   }) async {
-    final documents = await _dbHelper.getRagDocumentsWithEmbeddings(
-      limit: candidateLimit,
-    );
+    if (candidateLimit <= 0 || limit <= 0) return const [];
+    final documents = <RagDocument>[];
+    final db = await _dbHelper.database;
+    var offset = 0;
+    // Invalid projections must not consume the candidate budget. Read bounded
+    // pages until there are enough current candidates or the index is exhausted.
+    while (documents.length < candidateLimit) {
+      final page = await _dbHelper.getRagDocumentsWithEmbeddings(
+        limit: candidateLimit,
+        offset: offset,
+      );
+      if (page.isEmpty) break;
+      final current = await RagService._currentDocuments(db, page);
+      documents.addAll(current.take(candidateLimit - documents.length));
+      offset += page.length;
+      if (page.length < candidateLimit) break;
+    }
     return RagService.rankDocuments(
       queryEmbedding: queryEmbedding,
       documents: documents,
@@ -121,21 +135,25 @@ class RagService {
            SqliteRagVectorIndex(dbHelper ?? DatabaseHelper.instance);
 
   Future<void> indexMemory(MemoryEntry memory) async {
+    await _upsertEmbeddedDocument(_memoryDocument(memory));
+  }
+
+  static RagDocument _memoryDocument(MemoryEntry memory) {
     final sourceId = memory.id?.toString() ?? memory.key;
     final content =
         '${memory.key}: ${memory.value}\n类别: ${memory.category}\n来源: ${memory.source}\n重要度: ${memory.importance}';
-    await _upsertEmbeddedDocument(
+    return RagDocument(
       docKey: 'memory:$sourceId',
       sourceType: 'memory',
       sourceId: sourceId,
       title: '记忆：${memory.key}',
       content: content,
-      metadata: {
+      metadataJson: jsonEncode({
         'category': memory.category,
         'importance': memory.importance,
         'confidence': memory.confidence,
         'source': memory.source,
-      },
+      }),
     );
   }
 
@@ -149,23 +167,32 @@ class RagService {
 
   Future<void> indexMessage(Message message) async {
     if (message.id == null || message.content.trim().isEmpty) return;
+    await _upsertEmbeddedDocument(_messageDocument(message));
+  }
+
+  static RagDocument _messageDocument(Message message) {
     final roleLabel = message.isUser ? '用户消息' : 'AI回复';
-    await _upsertEmbeddedDocument(
+    return RagDocument(
       docKey: 'message:${message.id}',
       sourceType: 'conversation_message',
       sourceId: message.id.toString(),
       title: '$roleLabel ${message.createdAt.toIso8601String()}',
       content: '${message.isUser ? "用户" : "助手"}：${message.content}',
-      metadata: {
+      metadataJson: jsonEncode({
         'session_id': message.sessionId,
         'role': message.role,
         'created_at': message.createdAt.toIso8601String(),
-      },
+      }),
     );
   }
 
   Future<void> indexUserProfile(Map<String, dynamic> profile) async {
-    if (profile.isEmpty) return;
+    final document = _profileDocument(profile);
+    if (document != null) await _upsertEmbeddedDocument(document);
+  }
+
+  static RagDocument? _profileDocument(Map<String, dynamic> profile) {
+    if (profile.isEmpty) return null;
     final parts = <String>[];
     void add(String label, Object? value) {
       if (value != null && value.toString().trim().isNotEmpty) {
@@ -183,14 +210,14 @@ class RagService {
     add('用户画像', profile['userPortrait']);
     add('补充信息', profile['customInfo']);
 
-    if (parts.isEmpty) return;
-    await _upsertEmbeddedDocument(
+    if (parts.isEmpty) return null;
+    return RagDocument(
       docKey: 'user_profile:current',
       sourceType: 'user_profile',
       sourceId: 'current',
       title: '用户档案',
       content: parts.join('\n'),
-      metadata: profile,
+      metadataJson: jsonEncode(profile),
     );
   }
 
@@ -204,16 +231,34 @@ class RagService {
   }) async {
     if (summary.trim().isEmpty) return;
     await _upsertEmbeddedDocument(
-      docKey: docKey ?? 'conversation_summary:$id',
+      _summaryDocument(
+        docKey: docKey ?? 'conversation_summary:$id',
+        sourceId: sourceId ?? id.toString(),
+        summary: summary,
+        topics: topics,
+        emotions: emotions,
+      ),
+    );
+  }
+
+  static RagDocument _summaryDocument({
+    required String docKey,
+    required String sourceId,
+    required String summary,
+    String? topics,
+    String? emotions,
+  }) {
+    return RagDocument(
+      docKey: docKey,
       sourceType: 'conversation_summary',
-      sourceId: sourceId ?? id.toString(),
+      sourceId: sourceId,
       title: '对话摘要',
       content: [
         summary,
         if (topics != null && topics.trim().isNotEmpty) '主题：$topics',
         if (emotions != null && emotions.trim().isNotEmpty) '情绪：$emotions',
       ].join('\n'),
-      metadata: {'topics': topics, 'emotions': emotions},
+      metadataJson: jsonEncode({'topics': topics, 'emotions': emotions}),
     );
   }
 
@@ -227,7 +272,6 @@ class RagService {
     );
     if (rows.isEmpty) return;
 
-    final workout = rows.first;
     final setRows = await db.rawQuery(
       '''
       SELECT s.exercise_id, e.name as exercise_name, e.body_part, s.set_number,
@@ -239,7 +283,14 @@ class RagService {
       ''',
       [workoutId],
     );
+    await _upsertEmbeddedDocument(_workoutDocument(rows.first, setRows));
+  }
 
+  static RagDocument _workoutDocument(
+    Map<String, Object?> workout,
+    List<Map<String, Object?>> setRows,
+  ) {
+    final workoutId = workout['id'] as int;
     final title = workout['title']?.toString() ?? '训练记录';
     final volume = (workout['total_volume'] as num?)?.toDouble() ?? 0;
     final sets = workout['total_sets'] ?? 0;
@@ -262,7 +313,7 @@ class RagService {
       ].join('，');
     }).toList();
 
-    await _upsertEmbeddedDocument(
+    return RagDocument(
       docKey: 'workout:$workoutId',
       sourceType: 'workout',
       sourceId: workoutId.toString(),
@@ -276,12 +327,12 @@ class RagService {
         if (note != null && note.trim().isNotEmpty) '训练备注：$note',
         if (details.isNotEmpty) '动作明细：${details.join('；')}',
       ].join('\n'),
-      metadata: {
+      metadataJson: jsonEncode({
         'workout_id': workoutId,
         'total_volume': volume,
         'total_sets': sets,
         'duration_minutes': duration,
-      },
+      }),
     );
   }
 
@@ -302,6 +353,7 @@ class RagService {
       for (final doc in docs) doc['doc_key']?.toString() ?? '': doc,
     }..remove('');
     final issues = <RagAuditIssue>[];
+    final expectedKeys = <String>{};
     var expectedDocuments = 0;
 
     void expectDocument({
@@ -311,6 +363,7 @@ class RagService {
       required String message,
     }) {
       expectedDocuments++;
+      expectedKeys.add(docKey);
       if (!docsByKey.containsKey(docKey)) {
         issues.add(
           RagAuditIssue(
@@ -515,6 +568,29 @@ class RagService {
       }
     }
 
+    final expectedProjections = docs
+        .where((row) => expectedKeys.contains(row['doc_key']))
+        .map(RagDocument.fromMap)
+        .toList();
+    final currentProjections = (await _currentDocuments(
+      db,
+      expectedProjections,
+    )).toSet();
+    for (final document in expectedProjections) {
+      if (!currentProjections.contains(document)) {
+        issues.add(
+          RagAuditIssue(
+            code: 'stale_document',
+            docKey: document.docKey,
+            sourceType: document.sourceType,
+            sourceId: document.sourceId,
+            message: 'RAG projection no longer matches its current source',
+            canRepair: true,
+          ),
+        );
+      }
+    }
+
     return RagAuditReport(
       expectedDocuments: expectedDocuments,
       existingDocuments: docs.length,
@@ -562,11 +638,27 @@ class RagService {
       final queryEmbedding = await _embeddingService.embed(normalized);
       if (queryEmbedding.isEmpty) return const [];
 
-      return _vectorIndex.search(
+      final results = await _vectorIndex.search(
         queryEmbedding: queryEmbedding,
         limit: limit,
         minScore: minScore,
       );
+      if (!results.any(
+        (result) => _managedSourceTypes.contains(result.document.sourceType),
+      )) {
+        return results.take(limit).toList();
+      }
+      // Also validate externally supplied vector-index results and recheck
+      // sources that may have changed while the index was searching.
+      final db = await _dbHelper.database;
+      final current = (await _currentDocuments(
+        db,
+        results.map((result) => result.document).toList(),
+      )).toSet();
+      return results
+          .where((result) => current.contains(result.document))
+          .take(limit)
+          .toList();
     } catch (e) {
       Logger.e('RagService', 'Vector search failed: $e');
       return const [];
@@ -623,7 +715,7 @@ class RagService {
 
     try {
       final decoded = jsonDecode(embeddingJson);
-      if (decoded is! List) return null;
+      if (decoded is! List || decoded.isEmpty) return null;
       return decoded.map((v) => (v as num).toDouble()).toList();
     } catch (_) {
       return null;
@@ -644,34 +736,251 @@ class RagService {
     return dot / (sqrt(normA) * sqrt(normB));
   }
 
-  Future<void> _upsertEmbeddedDocument({
-    required String docKey,
-    required String sourceType,
-    String? sourceId,
-    required String title,
-    required String content,
-    Map<String, dynamic>? metadata,
-  }) async {
-    final trimmed = content.trim();
+  Future<void> _upsertEmbeddedDocument(RagDocument document) async {
+    final trimmed = document.content.trim();
     if (trimmed.isEmpty) return;
 
     try {
+      final db = await _dbHelper.database;
+      final snapshot = document.copyWith(content: trimmed);
+      if ((await _currentDocuments(db, [snapshot])).isEmpty) return;
       final embedding = await _embeddingService.embed(trimmed);
-      await _dbHelper.upsertRagDocument(
-        RagDocument(
-          docKey: docKey,
-          sourceType: sourceType,
-          sourceId: sourceId,
-          title: title,
-          content: trimmed,
-          metadataJson: metadata == null ? null : jsonEncode(metadata),
-          embeddingJson: jsonEncode(embedding),
-          embeddingModel: AppConstants.embeddingModel,
+      if (embedding.isEmpty) return;
+      // Never hold a DB transaction during a network request. Revalidate and
+      // store atomically afterwards, so a late result cannot restore old data.
+      await db.transaction((txn) async {
+        if ((await _currentDocuments(txn, [snapshot])).isEmpty) return;
+        await _dbHelper.upsertRagDocument(
+          snapshot.copyWith(
+            embeddingJson: jsonEncode(embedding),
+            embeddingModel: AppConstants.embeddingModel,
+          ),
+          executor: txn,
+        );
+      });
+    } catch (e) {
+      Logger.e('RagService', 'Index document failed (${document.docKey}): $e');
+    }
+  }
+
+  static const _managedSourceTypes = {
+    'memory',
+    'user_profile',
+    'conversation_message',
+    'conversation_summary',
+    'workout',
+  };
+
+  static String _sourceReference(RagDocument document) {
+    return document.sourceId ??
+        document.docKey.substring(document.docKey.indexOf(':') + 1);
+  }
+
+  /// Build canonical projections in batches. This uses the same formatters as
+  /// indexing and avoids one DB read per candidate. Unknown extension sources
+  /// retain their existing behavior; this is not a namespace/permission filter.
+  static Future<List<RagDocument>> _currentDocuments(
+    DatabaseExecutor db,
+    List<RagDocument> documents,
+  ) async {
+    final grouped = <String, List<RagDocument>>{};
+    for (final document in documents) {
+      grouped.putIfAbsent(document.sourceType, () => []).add(document);
+    }
+    final accepted = <RagDocument>{};
+    for (final group in grouped.entries) {
+      final type = group.key;
+      final candidates = group.value;
+      if (!_managedSourceTypes.contains(type)) {
+        accepted.addAll(candidates);
+        continue;
+      }
+      final references = candidates.map(_sourceReference).toSet();
+      final ids = references.map(int.tryParse).whereType<int>().toSet();
+      final sources = <String, RagDocument>{};
+      switch (type) {
+        case 'memory':
+          final rows = await _rowsForValues(db, 'memories', 'id', ids);
+          final now = DateTime.now();
+          for (final row in rows) {
+            final memory = MemoryEntry.fromMap(row);
+            if (memory.isActiveAt(now)) {
+              sources[memory.id.toString()] = _memoryDocument(memory);
+            }
+          }
+        case 'conversation_message':
+          final rows = await _rowsForValues(db, 'conversations', 'id', ids);
+          for (final row in rows) {
+            final message = Message.fromMap(row);
+            if (message.content.trim().isNotEmpty) {
+              sources[message.id.toString()] = _messageDocument(message);
+            }
+          }
+        case 'user_profile':
+          final profile = await _loadUserProfilePreference(db);
+          final projection = _profileDocument(profile);
+          if (projection != null) sources['current'] = projection;
+        case 'conversation_summary':
+          final bySession = await _rowsForValues(
+            db,
+            'conversation_summaries',
+            'session_id',
+            references,
+          );
+          final byId = await _rowsForValues(
+            db,
+            'conversation_summaries',
+            'id',
+            ids,
+          );
+          final summaries = <String, Map<String, Object?>>{};
+          for (final row in bySession) {
+            summaries.putIfAbsent(row['session_id'].toString(), () => row);
+          }
+          for (final row in byId) {
+            summaries.putIfAbsent(row['id'].toString(), () => row);
+          }
+          for (final candidate in candidates) {
+            final reference = _sourceReference(candidate);
+            final row = summaries[reference];
+            final text = row?['summary_text']?.toString();
+            if (row != null && text != null && text.trim().isNotEmpty) {
+              final projection = _summaryDocument(
+                docKey: candidate.docKey,
+                sourceId: reference,
+                summary: text,
+                topics: row['topics']?.toString(),
+                emotions: row['emotion_tags']?.toString(),
+              );
+              if (_sameProjection(candidate, projection)) {
+                accepted.add(candidate);
+              }
+            }
+          }
+          continue;
+        case 'workout':
+          final workouts = await _rowsForValues(
+            db,
+            'training_workouts',
+            'id',
+            ids,
+          );
+          final setsByWorkout = <int, List<Map<String, Object?>>>{};
+          final workoutIds = workouts.map((row) => row['id'] as int).toList();
+          for (var start = 0; start < workoutIds.length; start += 400) {
+            final batch = workoutIds.skip(start).take(400).toList();
+            final rows = await db.rawQuery('''
+              SELECT s.workout_id, s.exercise_id, e.name AS exercise_name,
+                     e.body_part, s.set_number, s.weight_kg, s.reps,
+                     s.duration_seconds, s.is_completed, s.note
+              FROM training_sets s
+              LEFT JOIN exercises e ON s.exercise_id = e.id
+              WHERE s.workout_id IN (${List.filled(batch.length, '?').join(',')})
+              ORDER BY s.workout_id ASC, s.exercise_id ASC, s.set_number ASC
+            ''', batch);
+            for (final row in rows) {
+              setsByWorkout
+                  .putIfAbsent(row['workout_id'] as int, () => [])
+                  .add(row);
+            }
+          }
+          for (final workout in workouts) {
+            final id = workout['id'] as int;
+            sources[id.toString()] = _workoutDocument(
+              workout,
+              setsByWorkout[id] ?? [],
+            );
+          }
+      }
+      for (final candidate in candidates) {
+        final projection = sources[_sourceReference(candidate)];
+        if (projection != null && _sameProjection(candidate, projection)) {
+          accepted.add(candidate);
+        }
+      }
+    }
+    return documents.where(accepted.contains).toList();
+  }
+
+  static Future<List<Map<String, Object?>>> _rowsForValues(
+    DatabaseExecutor db,
+    String table,
+    String column,
+    Iterable<Object> values,
+  ) async {
+    final unique = values.toSet().toList();
+    final rows = <Map<String, Object?>>[];
+    // Stay below the older Android SQLite bind-parameter limit.
+    for (var start = 0; start < unique.length; start += 400) {
+      final batch = unique.skip(start).take(400).toList();
+      rows.addAll(
+        await db.query(
+          table,
+          where: '$column IN (${List.filled(batch.length, '?').join(',')})',
+          whereArgs: batch,
+          orderBy: 'id ASC',
         ),
       );
-    } catch (e) {
-      Logger.e('RagService', 'Index document failed ($docKey): $e');
     }
+    return rows;
+  }
+
+  static bool _sameProjection(RagDocument indexed, RagDocument current) {
+    if (indexed.docKey != current.docKey ||
+        indexed.sourceType != current.sourceType ||
+        _sourceReference(indexed) != _sourceReference(current) ||
+        indexed.title != current.title ||
+        indexed.content.trim() != current.content.trim()) {
+      return false;
+    }
+    try {
+      return _sameMetadata(
+        indexed.metadataJson == null
+            ? const {}
+            : jsonDecode(indexed.metadataJson!),
+        current.metadataJson == null
+            ? const {}
+            : jsonDecode(current.metadataJson!),
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static bool _sameMetadata(Object? left, Object? right) {
+    if (left is Map && right is Map) {
+      final a = Map<Object?, Object?>.from(left)
+        ..removeWhere((_, value) => value == null || value == '');
+      final b = Map<Object?, Object?>.from(right)
+        ..removeWhere((_, value) => value == null || value == '');
+      return a.length == b.length &&
+          a.keys.every(
+            (key) => b.containsKey(key) && _sameMetadata(a[key], b[key]),
+          );
+    }
+    if (left is List && right is List) {
+      if (left.length != right.length) return false;
+      for (var i = 0; i < left.length; i++) {
+        if (!_sameMetadata(left[i], right[i])) return false;
+      }
+      return true;
+    }
+    return left == right;
+  }
+
+  Future<bool> _hasCurrentIndexedDocument(String docKey) async {
+    final db = await _dbHelper.database;
+    final rows = await db.query(
+      'rag_documents',
+      where: 'doc_key = ?',
+      whereArgs: [docKey],
+      limit: 1,
+    );
+    if (rows.isEmpty) return false;
+    final document = RagDocument.fromMap(rows.single);
+    final embedding = decodeEmbedding(document.embeddingJson);
+    if (embedding == null || embedding.isEmpty) return false;
+    return (await _currentDocuments(db, [document])).isNotEmpty;
   }
 
   Future<bool> _repairAuditIssue(RagAuditIssue issue) async {
@@ -696,15 +1005,16 @@ class RagService {
           return true;
         }
         await indexMemory(MemoryEntry.fromMap(rows.first));
-        return true;
+        return _hasCurrentIndexedDocument(issue.docKey);
       case 'user_profile':
         final profile = await _loadUserProfilePreference(db);
         if (profile.isEmpty) {
           await _dbHelper.deleteRagDocument(issue.docKey);
+          return true;
         } else {
           await indexUserProfile(profile);
         }
-        return true;
+        return _hasCurrentIndexedDocument(issue.docKey);
       case 'conversation_message':
         final id = int.tryParse(issue.sourceId ?? '');
         if (id == null) return false;
@@ -716,10 +1026,11 @@ class RagService {
         );
         if (rows.isEmpty) {
           await _dbHelper.deleteRagDocument(issue.docKey);
+          return true;
         } else {
           await indexMessage(Message.fromMap(rows.first));
         }
-        return true;
+        return _hasCurrentIndexedDocument(issue.docKey);
       case 'conversation_summary':
         final rows = await _summaryRowsForIssue(db, issue);
         if (rows.isEmpty) {
@@ -737,7 +1048,7 @@ class RagService {
           topics: row['topics']?.toString(),
           emotions: row['emotion_tags']?.toString(),
         );
-        return true;
+        return _hasCurrentIndexedDocument(issue.docKey);
       case 'workout':
         final id = int.tryParse(issue.sourceId ?? '');
         if (id == null) return false;
@@ -750,10 +1061,11 @@ class RagService {
         );
         if (rows.isEmpty) {
           await _dbHelper.deleteRagDocument(issue.docKey);
+          return true;
         } else {
           await indexWorkout(id);
         }
-        return true;
+        return _hasCurrentIndexedDocument(issue.docKey);
     }
     return false;
   }
@@ -792,7 +1104,9 @@ class RagService {
     );
   }
 
-  Future<Map<String, dynamic>> _loadUserProfilePreference(Database db) async {
+  static Future<Map<String, dynamic>> _loadUserProfilePreference(
+    DatabaseExecutor db,
+  ) async {
     final rows = await db.query(
       'user_preferences',
       columns: ['value'],
@@ -814,7 +1128,7 @@ class RagService {
     }
   }
 
-  String _formatWeight(double value) {
+  static String _formatWeight(double value) {
     return value.toStringAsFixed(value.truncateToDouble() == value ? 0 : 1);
   }
 }

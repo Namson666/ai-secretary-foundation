@@ -4,7 +4,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/database/database_helper.dart';
-import '../core/assistant/assistant_module.dart';
 import '../core/assistant/assistant_prompt.dart';
 import '../core/utils/logger.dart';
 import '../models/message.dart';
@@ -26,6 +25,9 @@ final aiLatencyServiceProvider = Provider<AiLatencyService>(
 );
 final memoryServiceProvider = Provider<MemoryService>(
   (ref) => MemoryService(llmService: ref.read(llmServiceProvider)),
+);
+final chatDatabaseProvider = Provider<DatabaseHelper>(
+  (ref) => DatabaseHelper.instance,
 );
 
 // ---------------------------------------------------------------------------
@@ -103,6 +105,7 @@ class InitialVoiceTextNotifier extends Notifier<String?> {
 class ChatNotifier extends Notifier<ChatState> {
   StreamSubscription<String>? _streamSubscription;
   int _requestGeneration = 0;
+  int _historyListGeneration = 0;
 
   /// Track session start time for summary trigger logic.
   DateTime? _sessionStartTime;
@@ -110,9 +113,21 @@ class ChatNotifier extends Notifier<ChatState> {
   @override
   ChatState build() {
     ref.onDispose(() {
-      _streamSubscription?.cancel();
+      _cancelRequest();
+      // Riverpod can reuse this Notifier with a fresh Ref after invalidation.
+      // A pending list query still belongs to the previous lifecycle.
+      _historyListGeneration++;
     });
     return const ChatState();
+  }
+
+  bool _isCurrentRequest(int generation) =>
+      ref.mounted && generation == _requestGeneration;
+
+  void _cancelRequest() {
+    _requestGeneration++;
+    unawaited(_streamSubscription?.cancel());
+    _streamSubscription = null;
   }
 
   // ---------------------------------------------------------------------------
@@ -121,15 +136,18 @@ class ChatNotifier extends Notifier<ChatState> {
 
   /// Send a plain-text message.
   Future<void> sendMessage(String content) async {
+    if (!ref.mounted) return;
     if (content.trim().isEmpty) return;
     if (state.isStreaming) return;
+    final selection = AssistantInputSnapshot.capture(ref).select(content);
     final generation = ++_requestGeneration;
+    final requestMessages = List<Message>.of(state.messages);
     state = state.copyWith(isStreaming: true, clearError: true);
 
     final llmService = ref.read(llmServiceProvider);
     final memoryService = ref.read(memoryServiceProvider);
     final latencyService = ref.read(aiLatencyServiceProvider);
-    final dbHelper = DatabaseHelper.instance;
+    final dbHelper = ref.read(chatDatabaseProvider);
 
     final sessionId = state.currentSessionId.isEmpty
         ? dailySessionId()
@@ -149,15 +167,19 @@ class ChatNotifier extends Notifier<ChatState> {
     try {
       final userId = await dbHelper.insertMessage(userMessage);
       final savedUser = userMessage.copyWith(id: userId);
+      if (!_isCurrentRequest(generation)) return;
       await memoryService.indexMessage(savedUser);
+      if (!_isCurrentRequest(generation)) return;
+      requestMessages.add(savedUser);
 
       state = state.copyWith(
-        messages: [...state.messages, savedUser],
+        messages: List<Message>.of(requestMessages),
         currentSessionId: sessionId,
         isStreaming: true,
         error: null,
       );
     } catch (e) {
+      if (!_isCurrentRequest(generation)) return;
       state = state.copyWith(
         error: 'Failed to save message',
         isStreaming: false,
@@ -166,12 +188,13 @@ class ChatNotifier extends Notifier<ChatState> {
       return;
     }
 
-    // 1.5 Extract memory from user input (fire-and-forget)
+    // 1.5 Extract memory from user input.
     try {
       await memoryService.extractFromUserInput(content);
     } catch (e) {
       Logger.e('ChatNotifier', 'Memory extraction error: $e');
     }
+    if (!_isCurrentRequest(generation)) return;
 
     // 2. Create placeholder AI message
     final aiMessage = Message(
@@ -180,6 +203,17 @@ class ChatNotifier extends Notifier<ChatState> {
       content: '',
     );
     state = state.copyWith(messages: [...state.messages, aiMessage]);
+    var currentAiMessage = aiMessage;
+
+    void publishAssistant(Message message, {bool? isStreaming}) {
+      if (!_isCurrentRequest(generation)) return;
+      final messages = List<Message>.of(state.messages);
+      final index = messages.indexOf(currentAiMessage);
+      if (index < 0) return;
+      messages[index] = message;
+      currentAiMessage = message;
+      state = state.copyWith(messages: messages, isStreaming: isStreaming);
+    }
 
     // 3. Stream AI response
     final rawBuffer = StringBuffer();
@@ -188,11 +222,13 @@ class ChatNotifier extends Notifier<ChatState> {
     bool hasError = false;
 
     try {
-      final modules = ref.read(assistantModuleRegistryProvider).select(content);
       final memoryContext = await memoryService.buildContext(
         query: content,
-        includeWorkoutHistory: modules.any((module) => module.id == 'fitness'),
+        includeWorkoutHistory: selection.modules.any(
+          (module) => module.id == 'fitness',
+        ),
       );
+      if (!_isCurrentRequest(generation)) return;
       unawaited(
         latencyService.recordEvent(
           sessionId: sessionId,
@@ -203,29 +239,25 @@ class ChatNotifier extends Notifier<ChatState> {
       final systemPrompt = AssistantPrompt.build(
         personality: ref.read(settingsProvider).personality,
         memoryContext: memoryContext,
-        moduleGuidance: AssistantModuleRegistry.guidanceFor(modules),
+        moduleGuidance: selection.guidance,
         voice: false,
       );
 
       final stream = llmService.sendWithTools(
-        messages: state.apiMessages,
+        messages: ChatState(messages: requestMessages).apiMessages,
         systemPrompt: systemPrompt,
-        tools: AssistantModuleRegistry.toolsFor(modules),
+        tools: selection.tools,
         onTool: (name, args) async {
-          if (!ref.mounted || generation != _requestGeneration) {
+          if (!_isCurrentRequest(generation)) {
             throw const FormatException('请求已取消');
           }
-          final result = await AssistantModuleRegistry.invoke(
-            modules,
+          final result = await selection.invoke(
             name,
             args,
             sessionId: sessionId,
             turnId: userMessage.createdAt.toIso8601String(),
           );
-          AssistantModuleRegistry.ownerOf(
-            modules,
-            name,
-          )?.afterTool(name, result);
+          selection.ownerOf(name)?.afterTool(name, result);
           return result;
         },
       );
@@ -233,6 +265,7 @@ class ChatNotifier extends Notifier<ChatState> {
       var firstTokenRecorded = false;
       _streamSubscription = stream.listen(
         (token) {
+          if (!_isCurrentRequest(generation)) return;
           rawBuffer.write(token);
           final visibleToken = memoryTagFilter.add(token);
           if (visibleToken.isEmpty) return;
@@ -248,13 +281,12 @@ class ChatNotifier extends Notifier<ChatState> {
             );
           }
           visibleBuffer.write(visibleToken);
-          final updatedMessages = List<Message>.from(state.messages);
-          updatedMessages[updatedMessages.length - 1] = aiMessage.copyWith(
-            content: visibleBuffer.toString(),
+          publishAssistant(
+            aiMessage.copyWith(content: visibleBuffer.toString()),
           );
-          state = state.copyWith(messages: updatedMessages);
         },
         onError: (error) {
+          if (!_isCurrentRequest(generation)) return;
           hasError = true;
           unawaited(
             latencyService.recordEvent(
@@ -272,6 +304,7 @@ class ChatNotifier extends Notifier<ChatState> {
           Logger.e('ChatNotifier', 'Stream error: $error');
         },
         onDone: () async {
+          if (!_isCurrentRequest(generation)) return;
           _streamSubscription = null;
 
           if (!hasError) {
@@ -287,23 +320,23 @@ class ChatNotifier extends Notifier<ChatState> {
             final finalContent = LlmService.sanitizeAssistantContent(
               rawFinalContent,
             );
-            final updatedMessages = List<Message>.from(state.messages);
             final savedAi = aiMessage.copyWith(content: finalContent);
+            var finalAi = savedAi;
 
             try {
               final aiId = await dbHelper.insertMessage(savedAi);
               final indexedAi = savedAi.copyWith(id: aiId);
+              if (!_isCurrentRequest(generation)) return;
               await memoryService.indexMessage(indexedAi);
-              updatedMessages[updatedMessages.length - 1] = indexedAi;
+              if (!_isCurrentRequest(generation)) return;
+              finalAi = indexedAi;
             } catch (e) {
               Logger.e('ChatNotifier', 'Insert AI message error: $e');
-              updatedMessages[updatedMessages.length - 1] = savedAi;
+              if (!_isCurrentRequest(generation)) return;
             }
 
-            state = state.copyWith(
-              messages: updatedMessages,
-              isStreaming: false,
-            );
+            publishAssistant(finalAi, isStreaming: false);
+            final updatedMessages = [...requestMessages, finalAi];
 
             // Process memory tags from AI response
             try {
@@ -311,6 +344,7 @@ class ChatNotifier extends Notifier<ChatState> {
             } catch (e) {
               Logger.e('ChatNotifier', 'Memory processing error: $e');
             }
+            if (!_isCurrentRequest(generation)) return;
 
             unawaited(memoryService.distillSessionToRag(sessionId));
             unawaited(
@@ -349,6 +383,7 @@ class ChatNotifier extends Notifier<ChatState> {
         cancelOnError: false,
       );
     } catch (e) {
+      if (!_isCurrentRequest(generation)) return;
       unawaited(
         latencyService.recordEvent(
           sessionId: sessionId,
@@ -364,9 +399,7 @@ class ChatNotifier extends Notifier<ChatState> {
 
   /// Start a new chat session.
   void startNewSession() {
-    _requestGeneration++;
-    _streamSubscription?.cancel();
-    _streamSubscription = null;
+    _cancelRequest();
     _sessionStartTime = null;
     state = const ChatState();
   }
@@ -381,16 +414,18 @@ class ChatNotifier extends Notifier<ChatState> {
 
   /// Clear all messages in the current session.
   void clearMessages() {
-    _requestGeneration++;
-    _streamSubscription?.cancel();
-    _streamSubscription = null;
+    _cancelRequest();
     state = state.copyWith(messages: [], isStreaming: false, error: null);
   }
 
   /// Load messages for the current or given session.
   Future<void> loadHistory({String? sessionId}) async {
-    final dbHelper = DatabaseHelper.instance;
+    if (!ref.mounted) return;
+    final dbHelper = ref.read(chatDatabaseProvider);
     final sid = sessionId ?? state.currentSessionId;
+    _cancelRequest();
+    final generation = _requestGeneration;
+    state = state.copyWith(isStreaming: false);
     if (sid.isEmpty) {
       state = state.copyWith(messages: []);
       return;
@@ -398,6 +433,7 @@ class ChatNotifier extends Notifier<ChatState> {
 
     try {
       final messages = await dbHelper.getMessages(sid);
+      if (!_isCurrentRequest(generation)) return;
       state = state.copyWith(
         messages: messages,
         currentSessionId: sid,
@@ -407,15 +443,19 @@ class ChatNotifier extends Notifier<ChatState> {
       _sessionStartTime = DateTime.now();
     } catch (e) {
       Logger.e('ChatNotifier', 'Load history error: $e');
+      if (!_isCurrentRequest(generation)) return;
       state = state.copyWith(error: 'Failed to load messages');
     }
   }
 
   /// Load the list of history sessions.
   Future<void> loadHistorySessions() async {
-    final dbHelper = DatabaseHelper.instance;
+    if (!ref.mounted) return;
+    final generation = ++_historyListGeneration;
+    final dbHelper = ref.read(chatDatabaseProvider);
     try {
       final sessions = await dbHelper.getHistorySessions();
+      if (!ref.mounted || generation != _historyListGeneration) return;
       state = state.copyWith(historySessions: sessions);
     } catch (e) {
       Logger.e('ChatNotifier', 'Load history sessions error: $e');
@@ -424,9 +464,7 @@ class ChatNotifier extends Notifier<ChatState> {
 
   /// Switch to a specific session.
   Future<void> switchToSession(String sessionId) async {
-    _requestGeneration++;
-    _streamSubscription?.cancel();
-    _streamSubscription = null;
+    _cancelRequest();
     _sessionStartTime = null;
     state = ChatState(currentSessionId: sessionId);
     await loadHistory();

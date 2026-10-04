@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
+
 import 'package:ai_secretary/core/database/database_helper.dart';
 import 'package:ai_secretary/services/avatar_audio_bridge.dart';
 import 'package:ai_secretary/services/tts_service.dart';
@@ -170,6 +171,42 @@ void main() {
         AvatarAudioBridge.play(Uint8List(4)),
         throwsA(isA<PlatformException>()),
       );
+    },
+  );
+  test(
+    'late failure from a detached avatar cannot stop the new avatar',
+    () async {
+      const nextAvatar = MethodChannel('avatar-next-test');
+      final oldPlay = Completer<bool>();
+      final entered = Completer<void>();
+      final oldStops = <MethodCall>[];
+      final nextCalls = <MethodCall>[];
+      messenger.setMockMethodCallHandler(avatar, (call) async {
+        if (call.method == 'playPcm') {
+          entered.complete();
+          return oldPlay.future;
+        }
+        oldStops.add(call);
+        return null;
+      });
+      messenger.setMockMethodCallHandler(nextAvatar, (call) async {
+        nextCalls.add(call);
+        return call.method == 'playPcm' ? true : null;
+      });
+      addTearDown(() {
+        AvatarAudioBridge.detach(nextAvatar);
+        messenger.setMockMethodCallHandler(nextAvatar, null);
+      });
+      final playing = AvatarAudioBridge.play(Uint8List(4));
+      final failure = expectLater(playing, throwsA(isA<PlatformException>()));
+      await entered.future;
+      AvatarAudioBridge.detach(avatar);
+      AvatarAudioBridge.attach(nextAvatar);
+      expect(await AvatarAudioBridge.play(Uint8List(4)), isTrue);
+      oldPlay.completeError(PlatformException(code: 'late_audio_error'));
+      await failure;
+      expect(nextCalls.map((call) => call.method), ['playPcm']);
+      expect(oldStops.map((call) => call.method), ['stopAudio']);
     },
   );
 }

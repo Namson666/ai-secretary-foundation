@@ -289,51 +289,63 @@ class DatabaseHelper {
   /// Insert a memory entry.
   Future<int> insertMemory(MemoryEntry entry) async {
     final db = await database;
-
-    // Check if a memory with same key already exists; update if so
-    final existing = await db.query(
-      'memories',
-      where: 'key = ?',
-      whereArgs: [entry.key],
-    );
-
-    if (existing.isNotEmpty) {
-      final existingId = existing.first['id'] as int;
-      // Merge: keep higher importance, update confidence, refresh timestamp
-      final existingImportance = existing.first['importance'] as int? ?? 0;
-      final mergedImportance = entry.importance > existingImportance
-          ? entry.importance
-          : existingImportance;
-      final existingConfidence =
-          (existing.first['confidence'] as num?)?.toDouble() ?? 0.0;
-      final mergedConfidence = entry.confidence > existingConfidence
-          ? entry.confidence
-          : existingConfidence;
-
-      await db.update(
+    // Keep lookup and merge in one transaction. The legacy schema has no
+    // unique key constraint; separate queries allow concurrent inserts to race.
+    return db.transaction((txn) async {
+      final existing = await txn.query(
         'memories',
-        {
-          'value': entry.value,
-          'category': entry.category,
-          'importance': mergedImportance,
-          'confidence': mergedConfidence,
-          'source': entry.source,
-          'last_confirmed_at': DateTime.now().toIso8601String(),
-          'expires_at': entry.expiresAt?.toIso8601String(),
-        },
-        where: 'id = ?',
-        whereArgs: [existingId],
+        where: 'key = ?',
+        whereArgs: [entry.key],
+        orderBy: 'id ASC',
+        limit: 1,
       );
-      Logger.d(
-        'DatabaseHelper',
-        'Updated memory id=$existingId key=${entry.key}',
-      );
-      return existingId;
-    }
 
-    final id = await db.insert('memories', entry.toMap());
-    Logger.d('DatabaseHelper', 'Inserted memory id=$id key=${entry.key}');
-    return id;
+      if (existing.isNotEmpty) {
+        final row = existing.first;
+        final existingId = row['id'] as int;
+        final existingSource = row['source']?.toString().trim().toLowerCase();
+        final incomingSource = entry.source.trim().toLowerCase();
+        // AI extraction is a suggestion, not a new explicit user confirmation.
+        // A later manual/user_input correction can still replace this record.
+        if ((existingSource == 'manual' || existingSource == 'user_input') &&
+            incomingSource == 'ai_extract') {
+          return existingId;
+        }
+
+        final existingImportance = row['importance'] as int? ?? 0;
+        final existingConfidence = (row['confidence'] as num?)?.toDouble() ?? 0;
+        final sameValue = row['value'] == entry.value;
+        await txn.update(
+          'memories',
+          {
+            'value': entry.value,
+            'category': entry.category,
+            'importance': entry.importance > existingImportance
+                ? entry.importance
+                : existingImportance,
+            // Confidence belongs to a value. A changed value cannot inherit the
+            // higher confidence of a contradictory, older fact.
+            'confidence': sameValue && existingConfidence > entry.confidence
+                ? existingConfidence
+                : entry.confidence,
+            'source': entry.source,
+            'last_confirmed_at': DateTime.now().toIso8601String(),
+            'expires_at': entry.expiresAt?.toIso8601String(),
+          },
+          where: 'id = ?',
+          whereArgs: [existingId],
+        );
+        Logger.d(
+          'DatabaseHelper',
+          'Updated memory id=$existingId key=${entry.key}',
+        );
+        return existingId;
+      }
+
+      final id = await txn.insert('memories', entry.toMap());
+      Logger.d('DatabaseHelper', 'Inserted memory id=$id key=${entry.key}');
+      return id;
+    });
   }
 
   /// Get all memories ordered by importance.
@@ -505,8 +517,11 @@ class DatabaseHelper {
   // RAG document CRUD
   // ---------------------------------------------------------------------------
 
-  Future<int> upsertRagDocument(RagDocument document) async {
-    final db = await database;
+  Future<int> upsertRagDocument(
+    RagDocument document, {
+    DatabaseExecutor? executor,
+  }) async {
+    final db = executor ?? await database;
     final existing = await db.query(
       'rag_documents',
       columns: ['id', 'created_at'],
@@ -534,14 +549,16 @@ class DatabaseHelper {
 
   Future<List<RagDocument>> getRagDocumentsWithEmbeddings({
     int limit = 300,
+    int offset = 0,
   }) async {
     final db = await database;
     final rows = await db.query(
       'rag_documents',
       where: 'embedding_json IS NOT NULL AND embedding_json != ?',
       whereArgs: [''],
-      orderBy: 'updated_at DESC',
+      orderBy: 'updated_at DESC, id DESC',
       limit: limit,
+      offset: offset,
     );
     return rows.map((r) => RagDocument.fromMap(r)).toList();
   }
