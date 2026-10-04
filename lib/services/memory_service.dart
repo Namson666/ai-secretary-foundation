@@ -265,7 +265,6 @@ class MemoryService {
             source: 'user_input',
           ),
         );
-        await _upsertUserProfilePatch({'name': name});
       }
     }
     if (!includeHealthExtraction) return;
@@ -290,7 +289,6 @@ class MemoryService {
         source: 'user_input',
       );
       await _saveMemory(entry);
-      await _upsertUserProfilePatch({'weight': double.tryParse(weight)});
       Logger.d('MemoryService', 'Auto-extracted weight: $weight kg');
     }
 
@@ -311,7 +309,6 @@ class MemoryService {
         source: 'user_input',
       );
       await _saveMemory(entry);
-      await _upsertUserProfilePatch({'height': double.tryParse(height)});
       Logger.d('MemoryService', 'Auto-extracted height: $height cm');
     }
 
@@ -334,7 +331,6 @@ class MemoryService {
         source: 'user_input',
       );
       await _saveMemory(entry);
-      await _upsertUserProfilePatch({'age': int.tryParse(age)});
       Logger.d('MemoryService', 'Auto-extracted age: $age');
     }
 
@@ -350,7 +346,6 @@ class MemoryService {
         source: 'user_input',
       );
       await _saveMemory(entry);
-      await _mergeUserProfileCondition(condition);
       Logger.d('MemoryService', 'Auto-extracted condition: $condition');
     }
 
@@ -371,7 +366,6 @@ class MemoryService {
         source: 'user_input',
       );
       await _saveMemory(entry);
-      await _upsertUserProfilePatch({'goal': goal});
       Logger.d('MemoryService', 'Auto-extracted goal: $goal');
     }
   }
@@ -784,8 +778,9 @@ class MemoryService {
     }
   }
 
-  Future<Map<String, dynamic>> _loadUserProfilePrefs() async {
-    final db = await _dbHelper.database;
+  Future<Map<String, dynamic>> _loadUserProfilePrefs(
+    DatabaseExecutor db,
+  ) async {
     final prefRows = await db.query(
       'user_preferences',
       columns: ['value'],
@@ -804,33 +799,6 @@ class MemoryService {
       Logger.e('MemoryService', 'Invalid user_profile preference json: $e');
       return <String, dynamic>{};
     }
-  }
-
-  Future<void> _upsertUserProfilePatch(Map<String, dynamic> patch) async {
-    final cleanPatch = Map<String, dynamic>.from(patch)
-      ..removeWhere((_, value) => value == null || value == '');
-    if (cleanPatch.isEmpty) return;
-
-    final db = await _dbHelper.database;
-    final profile = await _loadUserProfilePrefs();
-    profile.addAll(cleanPatch);
-    await db.insert('user_preferences', {
-      'key': 'user_profile',
-      'value': jsonEncode(profile),
-      'updated_at': DateTime.now().toIso8601String(),
-    }, conflictAlgorithm: ConflictAlgorithm.replace);
-    await _ragService.indexUserProfile(profile);
-  }
-
-  Future<void> _mergeUserProfileCondition(String condition) async {
-    final profile = await _loadUserProfilePrefs();
-    final existing = profile['conditions']?.toString().trim();
-    final parts = <String>{
-      if (existing != null && existing.isNotEmpty)
-        ...existing.split(RegExp(r'[、,，;；]\s*')).where((p) => p.isNotEmpty),
-      condition,
-    };
-    await _upsertUserProfilePatch({'conditions': parts.join('、')});
   }
 
   String _normalizeGoal(String goal) {
@@ -857,19 +825,62 @@ class MemoryService {
       importance: route.normalizedImportance,
     );
     final id = await _dbHelper.insertMemory(routedEntry);
-    final savedEntry = routedEntry.copyWith(id: id);
-
-    if (route.profilePatch.isNotEmpty) {
-      final conditions = route.profilePatch['conditions'];
-      if (conditions is String && conditions.trim().isNotEmpty) {
-        await _mergeUserProfileCondition(conditions);
-      } else {
-        await _upsertUserProfilePatch(route.profilePatch);
+    final db = await _dbHelper.database;
+    // Re-read the accepted fact and update its profile projection in one short
+    // transaction. A rejected AI suggestion (or a newer concurrent correction)
+    // must never leak into the profile or the vector index.
+    final projection = await db.transaction((txn) async {
+      final rows = await txn.query(
+        'memories',
+        where: 'id = ?',
+        whereArgs: [id],
+        limit: 1,
+      );
+      if (rows.isEmpty) return null;
+      final saved = MemoryEntry.fromMap(rows.single);
+      if (!saved.isActive) return null;
+      final savedRoute = _memoryPolicy.route(
+        key: saved.key,
+        value: saved.value,
+        category: saved.category,
+        importance: saved.importance,
+      );
+      final patch = Map<String, dynamic>.from(savedRoute.profilePatch)
+        ..removeWhere((_, value) => value == null || value == '');
+      Map<String, dynamic>? profile;
+      if (patch.isNotEmpty) {
+        profile = await _loadUserProfilePrefs(txn);
+        final conditions = patch['conditions'];
+        if (conditions is String && conditions.trim().isNotEmpty) {
+          final existing = profile['conditions']?.toString().trim();
+          patch['conditions'] = <String>{
+            if (existing != null && existing.isNotEmpty)
+              ...existing
+                  .split(RegExp(r'[、,，;；]\s*'))
+                  .where((p) => p.isNotEmpty),
+            conditions,
+          }.join('、');
+        }
+        profile.addAll(patch);
+        await txn.insert('user_preferences', {
+          'key': 'user_profile',
+          'value': jsonEncode(profile),
+          'updated_at': DateTime.now().toIso8601String(),
+        }, conflictAlgorithm: ConflictAlgorithm.replace);
       }
-    }
+      return (
+        memory: saved,
+        profile: profile,
+        indexInRag: savedRoute.indexInRag,
+      );
+    });
 
-    if (route.indexInRag) {
-      await _ragService.indexMemory(savedEntry);
+    // Network requests must remain outside the SQLite transaction.
+    if (projection?.profile case final profile?) {
+      await _ragService.indexUserProfile(profile);
+    }
+    if (projection != null && projection.indexInRag) {
+      await _ragService.indexMemory(projection.memory);
     }
     return id;
   }

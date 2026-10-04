@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import 'features/digital_human/screens/home_screen.dart';
 import 'features/settings/screens/foundation_settings_screen.dart';
+import 'providers/assistant_modules_provider.dart';
 import 'providers/digital_human_provider.dart';
 import 'services/call_foreground_service.dart';
 import 'shared/theme/app_theme.dart';
@@ -46,17 +47,20 @@ class FoundationApp extends ConsumerStatefulWidget {
 
 class _FoundationAppState extends ConsumerState<FoundationApp>
     with WidgetsBindingObserver {
+  late final VoidCallback _unsubscribeReturnRequested;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    CallForegroundService.onReturnRequested(() {
+    _unsubscribeReturnRequested = CallForegroundService.onReturnRequested(() {
       if (mounted) ref.read(foundationRouterProvider).go('/');
     });
   }
 
   @override
   void dispose() {
+    _unsubscribeReturnRequested();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -70,6 +74,9 @@ class _FoundationAppState extends ConsumerState<FoundationApp>
 
   @override
   Widget build(BuildContext context) {
+    ref
+        .watch(assistantModuleRegistryProvider)
+        .validateProfile(ref.watch(assistantAppProfileProvider));
     ref.listen(digitalHumanProvider, (_, _) {});
     return MaterialApp.router(
       title: '数字人底座',

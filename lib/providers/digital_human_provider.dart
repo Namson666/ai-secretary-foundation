@@ -126,16 +126,85 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
   int _generation = 0;
   int _voiceSession = 0;
   int _callSession = 0;
+  bool _startingVoice = false;
+  bool _finishingVoice = false;
   bool _startingCall = false;
   bool _checkingCall = false;
+  AsrEngine? _activeVoiceEngine;
   AsrEngine? _activeCallEngine;
+  AssistantInputSnapshot? _voiceInputSnapshot;
+  Future<void> Function()? _cancelVoiceCapture;
+  Future<void> Function()? _cancelCallCapture;
+  Future<void> Function()? _stopOutput;
+  Future<void> _captureTeardown = Future<void>.value();
+  Future<void>? _callTeardown;
   int? _pendingVoiceActionId;
   AssistantModule? _pendingVoiceModule;
 
   @override
   DigitalHumanState build() {
-    CallForegroundService.onStopRequested(endCall);
+    final unsubscribe = CallForegroundService.onStopRequested(endCall);
+    ref.onDispose(() {
+      _generation++;
+      _voiceSession++;
+      _callSession++;
+      unsubscribe();
+      final hadCall = _startingCall || _activeCallEngine != null;
+      final cancelVoice = _cancelVoiceCapture;
+      final cancelCall = _cancelCallCapture;
+      final stopOutput = _stopOutput;
+      _cancelVoiceCapture = null;
+      _cancelCallCapture = null;
+      _stopOutput = null;
+      _activeVoiceEngine = null;
+      _activeCallEngine = null;
+      _voiceInputSnapshot = null;
+      _pendingVoiceActionId = null;
+      _pendingVoiceModule = null;
+      if (cancelVoice != null || cancelCall != null || hadCall) {
+        unawaited(
+          _queueCaptureTeardown(() async {
+            await _release(cancelVoice);
+            await _release(cancelCall);
+            if (hadCall) await _release(CallForegroundService.stop);
+          }),
+        );
+      }
+      unawaited(_release(stopOutput));
+    });
     return const DigitalHumanState();
+  }
+
+  bool _ownsVoiceInput(int session) => ref.mounted && session == _voiceSession;
+
+  TtsService get _tts {
+    final service = ref.read(digitalHumanTtsServiceProvider);
+    _stopOutput = service.stop;
+    return service;
+  }
+
+  static Future<void> _release(Future<void> Function()? release) async {
+    try {
+      await release?.call();
+    } catch (error) {
+      Logger.w('DigitalHuman', 'Resource cleanup failed: $error');
+    }
+  }
+
+  // Both input modes use the same ASR services. Clearing their UI ownership
+  // cannot permit a new capture until the previous microphone cleanup ends.
+  Future<void> _queueCaptureTeardown(Future<void> Function() teardown) {
+    final pending = _captureTeardown.then((_) => _release(teardown));
+    _captureTeardown = pending;
+    return pending;
+  }
+
+  Future<void> _awaitCaptureTeardown() async {
+    while (true) {
+      final pending = _captureTeardown;
+      await pending;
+      if (identical(pending, _captureTeardown)) return;
+    }
   }
 
   void setInitialized() {
@@ -155,6 +224,7 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
   }
 
   void reset() {
+    unawaited(cancelVoiceInput());
     unawaited(endCall());
     stopCurrentOutput();
     state = const DigitalHumanState();
@@ -166,57 +236,78 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
 
   /// 开始录音（会打断当前播放/生成）
   Future<void> startVoiceInput() async {
-    if (state.isRecording) return;
+    if (!ref.mounted ||
+        state.isRecording ||
+        _startingVoice ||
+        _finishingVoice ||
+        state.isCallActive ||
+        _startingCall) {
+      return;
+    }
+    final input = AssistantInputSnapshot.capture(ref);
     stopCurrentOutput();
     final session = ++_voiceSession;
+    final engine = ref.read(settingsProvider).asrEngine;
+    _activeVoiceEngine = engine;
+    _voiceInputSnapshot = input;
+    _startingVoice = true;
+    Future<void> Function()? cancelCapture;
     state = state.copyWith(
       isRecording: true,
       subtitleText: '准备语音识别...',
       errorMessage: '',
     );
     try {
-      final engine = ref.read(settingsProvider).asrEngine;
+      await _awaitCaptureTeardown();
+      if (!_ownsVoiceInput(session) || _activeVoiceEngine != engine) return;
       if (engine == AsrEngine.minimaxFile) {
-        await ref.read(miniMaxFileAsrProvider).start();
+        final service = ref.read(miniMaxFileAsrProvider);
+        _cancelVoiceCapture = cancelCapture = service.cancel;
+        await service.start();
       } else if (engine == AsrEngine.aliyunFlash) {
-        await ref
-            .read(aliyunRealtimeAsrProvider)
-            .start(
-              onPartial: (text) {
-                if (session == _voiceSession && state.isRecording) {
-                  state = state.copyWith(subtitleText: text);
-                }
-              },
-              onFinal: (text) {
-                if (session == _voiceSession && state.isRecording) {
-                  state = state.copyWith(subtitleText: text);
-                }
-              },
-              onSpeechStart: () {},
-            );
+        final service = ref.read(aliyunRealtimeAsrProvider);
+        _cancelVoiceCapture = cancelCapture = service.stop;
+        await service.start(
+          onPartial: (text) {
+            if (_ownsVoiceInput(session) && state.isRecording) {
+              state = state.copyWith(subtitleText: text);
+            }
+          },
+          onFinal: (text) {
+            if (_ownsVoiceInput(session) && state.isRecording) {
+              state = state.copyWith(subtitleText: text);
+            }
+          },
+          onSpeechStart: () {},
+        );
       } else {
-        await ref.read(localStreamingAsrProvider).start((text) {
-          if (session == _voiceSession && state.isRecording) {
+        final service = ref.read(localStreamingAsrProvider);
+        _cancelVoiceCapture = cancelCapture = service.cancel;
+        await service.start((text) {
+          if (_ownsVoiceInput(session) && state.isRecording) {
             state = state.copyWith(
               subtitleText: text.isEmpty ? '正在聆听...' : text,
             );
           }
         });
       }
+      if (!_ownsVoiceInput(session) || _activeVoiceEngine != engine) {
+        await _release(cancelCapture);
+      }
     } catch (e) {
       Logger.e('DigitalHuman', 'ASR start failed: $e');
-      if (session == _voiceSession) {
-        final detail =
-            e is StateError ||
-                ref.read(settingsProvider).asrEngine == AsrEngine.aliyunFlash
+      if (_ownsVoiceInput(session)) {
+        _activeVoiceEngine = null;
+        _voiceInputSnapshot = null;
+        _cancelVoiceCapture = null;
+        final detail = e is StateError || engine == AsrEngine.aliyunFlash
             ? AliyunRealtimeAsrService.safeError(e)
             : e.toString();
         unawaited(
           _recordVoiceStage(
             ref.read(digitalHumanLatencyServiceProvider),
             sessionId: ChatNotifier.dailySessionId(),
-            provider:
-                'digital_voice.asr.${ref.read(settingsProvider).asrEngine.name}',
+            provider: 'digital_voice.asr.${engine.name}',
             latency: Duration.zero,
             success: false,
             errorMessage: detail,
@@ -228,33 +319,59 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
           errorMessage: '无法开始语音识别：$detail',
         );
       }
+    } finally {
+      _startingVoice = false;
     }
   }
 
   /// 取消录音（上划取消）
   Future<void> cancelVoiceInput() async {
+    if (!ref.mounted || _activeVoiceEngine == null) return;
+    final cancelCapture = _cancelVoiceCapture;
     _voiceSession++;
+    _activeVoiceEngine = null;
+    _voiceInputSnapshot = null;
+    _cancelVoiceCapture = null;
+    final teardown = _queueCaptureTeardown(() async {
+      await cancelCapture?.call();
+    });
+    stopCurrentOutput();
     state = state.copyWith(isRecording: false, subtitleText: '');
-    await ref.read(localStreamingAsrProvider).cancel();
-    await ref.read(aliyunRealtimeAsrProvider).stop();
-    await ref.read(miniMaxFileAsrProvider).cancel();
+    await teardown;
   }
 
   /// 停止实时识别，再交给既有的 LLM 和数字人播报流水线。
   Future<void> finishVoiceInput() async {
-    if (!state.isRecording) return;
+    if (!ref.mounted || !state.isRecording) return;
+    if (_startingVoice) {
+      await cancelVoiceInput();
+      return;
+    }
     final session = _voiceSession;
-    final engine = ref.read(settingsProvider).asrEngine;
+    final generation = _generation;
+    final engine = _activeVoiceEngine;
+    if (engine == null) return;
+    final input =
+        _voiceInputSnapshot ?? AssistantInputSnapshot.withoutContext(ref);
+    bool current() => _ownsVoiceInput(session) && generation == _generation;
+    _finishingVoice = true;
     state = state.copyWith(isRecording: false, isProcessing: true);
     final watch = Stopwatch()..start();
     try {
-      final text = (await switch (engine) {
-        AsrEngine.local => ref.read(localStreamingAsrProvider).finish(),
-        AsrEngine.aliyunFlash => ref.read(aliyunRealtimeAsrProvider).finish(),
-        AsrEngine.minimaxFile => ref.read(miniMaxFileAsrProvider).finish(),
-      }).trim();
+      final String text;
+      try {
+        text = (await switch (engine) {
+          AsrEngine.local => ref.read(localStreamingAsrProvider).finish(),
+          AsrEngine.aliyunFlash => ref.read(aliyunRealtimeAsrProvider).finish(),
+          AsrEngine.minimaxFile => ref.read(miniMaxFileAsrProvider).finish(),
+        }).trim();
+      } finally {
+        // A driver's finish may stop capture in its own finally block. Keep
+        // ownership until that cleanup ends, even after UI cancellation.
+        _finishingVoice = false;
+      }
       watch.stop();
-      if (session != _voiceSession) return;
+      if (!current()) return;
       await _recordVoiceStage(
         ref.read(digitalHumanLatencyServiceProvider),
         sessionId: ChatNotifier.dailySessionId(),
@@ -263,6 +380,7 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
         success: text.isNotEmpty,
         errorMessage: text.isEmpty ? 'empty_asr_text' : null,
       );
+      if (!current()) return;
       if (text.isEmpty) {
         state = state.copyWith(
           isProcessing: false,
@@ -271,10 +389,13 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
         );
         return;
       }
-      await _runTurn(inputText: text, fromVoice: true);
+      _activeVoiceEngine = null;
+      _voiceInputSnapshot = null;
+      _cancelVoiceCapture = null;
+      await _runTurn(inputText: text, input: input, fromVoice: true);
     } catch (e) {
       Logger.e('DigitalHuman', 'ASR finish failed: $e');
-      if (session == _voiceSession) {
+      if (current()) {
         final detail = engine == AsrEngine.aliyunFlash
             ? AliyunRealtimeAsrService.safeError(e)
             : e.toString();
@@ -286,17 +407,32 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
           success: false,
           errorMessage: detail,
         );
+        if (!current()) return;
         state = state.copyWith(
           isProcessing: false,
           subtitleText: '',
           errorMessage: '语音识别失败：$detail',
         );
       }
+    } finally {
+      if (_ownsVoiceInput(session)) {
+        _activeVoiceEngine = null;
+        _voiceInputSnapshot = null;
+        _cancelVoiceCapture = null;
+      }
     }
   }
 
   Future<void> startCall() async {
-    if (state.isCallActive || _startingCall) return;
+    if (!ref.mounted ||
+        state.isCallActive ||
+        _startingCall ||
+        state.isRecording ||
+        _startingVoice ||
+        _finishingVoice ||
+        _activeVoiceEngine != null) {
+      return;
+    }
     final engine = ref.read(settingsProvider).asrEngine;
     if (engine == AsrEngine.minimaxFile) {
       state = state.copyWith(errorMessage: 'MiniMax ASR 1.0 只支持录音后识别，请长按麦克风');
@@ -305,42 +441,51 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
     _startingCall = true;
     stopCurrentOutput();
     final session = ++_callSession;
+    bool current() => ref.mounted && session == _callSession;
+    final latencyService = ref.read(digitalHumanLatencyServiceProvider);
+    Future<void> Function()? cancelCapture;
     final activeEngine = engine;
+    AssistantInputSnapshot? utteranceInput;
     var aliyunReady = false;
     final asrWatch = Stopwatch()..start();
     void partial(String text) {
-      if (session == _callSession && state.isCallActive && text.isNotEmpty) {
+      if (current() && state.isCallActive && text.isNotEmpty) {
         state = state.copyWith(subtitleText: text);
       }
     }
 
     void speechStart() {
-      if (session != _callSession || !state.isCallActive) return;
+      if (!current() || !state.isCallActive) return;
+      utteranceInput = AssistantInputSnapshot.capture(ref);
       asrWatch.reset();
-      if (state.isSpeaking || state.isProcessing) stopCurrentOutput();
+      stopCurrentOutput();
       state = state.copyWith(subtitleText: '正在聆听...');
     }
 
     void finalText(String text) {
-      if (session != _callSession ||
-          !state.isCallActive ||
-          text.trim().isEmpty) {
-        return;
-      }
+      if (!current() || !state.isCallActive) return;
+      final captured = utteranceInput;
+      utteranceInput = null;
+      if (text.trim().isEmpty) return;
+      final input = captured ?? AssistantInputSnapshot.withoutContext(ref);
       stopCurrentOutput();
       unawaited(
         _recordVoiceStage(
-          ref.read(digitalHumanLatencyServiceProvider),
+          latencyService,
           sessionId: ChatNotifier.dailySessionId(),
           provider: 'digital_voice.asr_utterance.${activeEngine.name}',
           latency: asrWatch.elapsed,
         ),
       );
       asrWatch.reset();
-      unawaited(_runTurn(inputText: text.trim(), fromVoice: true));
+      unawaited(
+        _runTurn(inputText: text.trim(), input: input, fromVoice: true),
+      );
     }
 
     try {
+      await _awaitCaptureTeardown();
+      if (!current()) return;
       if (Platform.isAndroid) {
         final permissionProbe = AudioRecorder();
         try {
@@ -351,9 +496,9 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
           await permissionProbe.dispose();
         }
       }
-      if (session != _callSession) return;
+      if (!current()) return;
       await CallForegroundService.start();
-      if (session != _callSession) {
+      if (!current()) {
         await CallForegroundService.stop();
         return;
       }
@@ -365,32 +510,34 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
       _activeCallEngine = engine;
       if (engine == AsrEngine.aliyunFlash) {
         try {
-          await ref
-              .read(aliyunRealtimeAsrProvider)
-              .start(
-                onPartial: partial,
-                onFinal: finalText,
-                onSpeechStart: speechStart,
-                onError: (error) {
-                  if (aliyunReady &&
-                      session == _callSession &&
-                      state.isCallActive) {
-                    final detail = AliyunRealtimeAsrService.safeError(error);
-                    unawaited(
-                      _recordVoiceStage(
-                        ref.read(digitalHumanLatencyServiceProvider),
-                        sessionId: ChatNotifier.dailySessionId(),
-                        provider: 'digital_voice.asr_utterance.aliyunFlash',
-                        latency: asrWatch.elapsed,
-                        success: false,
-                        errorMessage: detail,
-                      ),
-                    );
-                    state = state.copyWith(errorMessage: '阿里实时识别中断：$detail');
-                    unawaited(endCall());
-                  }
-                },
-              );
+          final service = ref.read(aliyunRealtimeAsrProvider);
+          _cancelCallCapture = cancelCapture = service.stop;
+          await service.start(
+            onPartial: partial,
+            onFinal: finalText,
+            onSpeechStart: speechStart,
+            onError: (error) {
+              if (aliyunReady && current() && state.isCallActive) {
+                final detail = AliyunRealtimeAsrService.safeError(error);
+                unawaited(
+                  _recordVoiceStage(
+                    latencyService,
+                    sessionId: ChatNotifier.dailySessionId(),
+                    provider: 'digital_voice.asr_utterance.aliyunFlash',
+                    latency: asrWatch.elapsed,
+                    success: false,
+                    errorMessage: detail,
+                  ),
+                );
+                state = state.copyWith(errorMessage: '阿里实时识别中断：$detail');
+                unawaited(endCall());
+              }
+            },
+          );
+          if (!current()) {
+            await _release(cancelCapture);
+            return;
+          }
           aliyunReady = true;
           return;
         } catch (error) {
@@ -401,18 +548,19 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
           rethrow;
         }
       }
-      await ref
-          .read(localStreamingAsrProvider)
-          .startConversation(
-            onPartial: partial,
-            onUtterance: finalText,
-            onSpeechStart: speechStart,
-          );
+      final service = ref.read(localStreamingAsrProvider);
+      _cancelCallCapture = cancelCapture = service.cancel;
+      await service.startConversation(
+        onPartial: partial,
+        onUtterance: finalText,
+        onSpeechStart: speechStart,
+      );
+      if (!current()) await _release(cancelCapture);
     } catch (error) {
       if (engine == AsrEngine.aliyunFlash) {
         unawaited(
           _recordVoiceStage(
-            ref.read(digitalHumanLatencyServiceProvider),
+            latencyService,
             sessionId: ChatNotifier.dailySessionId(),
             provider: 'digital_voice.asr.aliyunFlash',
             latency: asrWatch.elapsed,
@@ -425,14 +573,16 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
         'DigitalHuman',
         'Call start failed: ${engine == AsrEngine.aliyunFlash ? AliyunRealtimeAsrService.safeError(error) : error}',
       );
-      if (session == _callSession) {
+      if (current()) {
         state = state.copyWith(
           isCallActive: false,
           errorMessage:
               '无法开始实时通话：${engine == AsrEngine.aliyunFlash ? AliyunRealtimeAsrService.safeError(error) : error}',
         );
+        _activeCallEngine = null;
+        _cancelCallCapture = null;
       }
-      _activeCallEngine = null;
+      await _release(cancelCapture);
       await CallForegroundService.stop();
     } finally {
       _startingCall = false;
@@ -440,34 +590,56 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
   }
 
   Future<void> endCall() async {
-    if (!state.isCallActive && !_startingCall) return;
+    if (!ref.mounted) return;
+    final hadCall = state.isCallActive || _startingCall;
     _callSession++;
+    final pending = _callTeardown;
+    if (pending != null) {
+      await pending;
+      return;
+    }
+    if (!hadCall) return;
+    final cancelCapture = _cancelCallCapture;
+    _cancelCallCapture = null;
     _activeCallEngine = null;
     _pendingVoiceActionId = null;
     _pendingVoiceModule = null;
+    final teardown = _queueCaptureTeardown(() async {
+      try {
+        await cancelCapture?.call();
+      } finally {
+        await CallForegroundService.stop();
+      }
+    });
+    _callTeardown = teardown;
     stopCurrentOutput();
     state = state.copyWith(isCallActive: false, subtitleText: '');
     try {
-      await ref.read(localStreamingAsrProvider).cancel();
-      await ref.read(aliyunRealtimeAsrProvider).stop();
+      await teardown;
     } finally {
-      await CallForegroundService.stop();
+      if (identical(_callTeardown, teardown)) _callTeardown = null;
     }
   }
 
   Future<void> resumeCallIfNeeded() async {
-    if (!state.isCallActive || _checkingCall || _startingCall) return;
+    if (!ref.mounted || !state.isCallActive || _checkingCall || _startingCall) {
+      return;
+    }
     _checkingCall = true;
+    final session = _callSession;
     try {
       final engine = _activeCallEngine;
       final listening = engine == AsrEngine.aliyunFlash
           ? await ref.read(aliyunRealtimeAsrProvider).isCapturing
           : await ref.read(localStreamingAsrProvider).isCapturing;
-      if (!state.isCallActive ||
+      if (!ref.mounted ||
+          session != _callSession ||
+          !state.isCallActive ||
           (listening && engine == ref.read(settingsProvider).asrEngine)) {
         return;
       }
       await endCall();
+      if (!ref.mounted || _callSession != session + 1) return;
       await startCall();
     } finally {
       _checkingCall = false;
@@ -476,20 +648,26 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
 
   /// Typed input shares the avatar's memory, tools, TTS and lip-sync pipeline.
   Future<void> sendTextInput(String text) async {
+    if (!ref.mounted) return;
     if (text.trim().isEmpty || state.isProcessing || state.isRecording) return;
+    final input = AssistantInputSnapshot.capture(ref);
     stopCurrentOutput();
-    await _runTurn(inputText: text.trim());
+    await _runTurn(inputText: text.trim(), input: input);
   }
 
   Future<void> _runTurn({
     required String inputText,
+    required AssistantInputSnapshot input,
     bool fromVoice = false,
   }) async {
+    final generation = ++_generation;
+    bool cancelled() => !ref.mounted || generation != _generation;
     final speedCommand = VoiceSpeedCommands.parse(inputText);
     if (speedCommand != null) {
       final settings = ref.read(settingsProvider);
       final next = VoiceSpeedCommands.apply(speedCommand, settings.ttsSpeed);
       await ref.read(settingsProvider.notifier).setTtsSpeed(next);
+      if (cancelled()) return;
       state = state.copyWith(
         isProcessing: false,
         subtitleText: '',
@@ -497,20 +675,18 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
       );
       state = state.copyWith(isSpeaking: true);
       try {
-        await ref
-            .read(digitalHumanTtsServiceProvider)
-            .speak(
-              speedCommand == VoiceSpeedCommand.normal ? '好，恢复正常语速。' : '好。',
-            );
+        await _tts.speak(
+          speedCommand == VoiceSpeedCommand.normal ? '好，恢复正常语速。' : '好。',
+        );
       } catch (error) {
-        state = state.copyWith(errorMessage: '语速已调整，但语音反馈失败：$error');
+        if (!cancelled()) {
+          state = state.copyWith(errorMessage: '语速已调整，但语音反馈失败：$error');
+        }
       } finally {
-        state = state.copyWith(isSpeaking: false);
+        if (!cancelled()) state = state.copyWith(isSpeaking: false);
       }
       return;
     }
-    final generation = ++_generation;
-    bool cancelled() => generation != _generation;
     final stagePrefix = fromVoice ? 'digital_voice' : 'digital_text';
     state = state.copyWith(
       isRecording: false,
@@ -518,14 +694,18 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
       errorMessage: '',
     );
     final totalWatch = Stopwatch()..start();
-    final ttsService = ref.read(digitalHumanTtsServiceProvider);
+    final ttsService = _tts;
     final memoryService = ref.read(digitalHumanMemoryServiceProvider);
     final llmService = ref.read(digitalHumanLlmServiceProvider);
     final latencyService = ref.read(digitalHumanLatencyServiceProvider);
     final sessionId = ChatNotifier.dailySessionId();
     if (fromVoice && _pendingVoiceActionId != null) {
       final module = _pendingVoiceModule;
-      final decision = module?.voiceDecision(inputText);
+      final available =
+          module != null &&
+          input.profile.allowsModule(module.id) &&
+          input.registry.modules.contains(module);
+      final decision = available ? module.voiceDecision(inputText) : null;
       final actionId = _pendingVoiceActionId;
       _pendingVoiceActionId = null;
       _pendingVoiceModule = null;
@@ -556,7 +736,7 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
             state = state.copyWith(
               isProcessing: false,
               isSpeaking: false,
-              errorMessage: '训练操作未完成：$error',
+              errorMessage: '操作未完成：$error',
             );
           }
         }
@@ -574,17 +754,21 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
 
     try {
       final text = inputText;
+      final selection = input.select(text);
 
       // 显示用户说的话
       failureStage = '对话';
       state = state.copyWith(subtitleText: text);
       final contextWatch = Stopwatch()..start();
       await memoryService.extractFromUserInput(text);
-      final modules = ref.read(assistantModuleRegistryProvider).select(text);
+      if (cancelled()) return;
       final memoryContext = await memoryService.buildContext(
         query: text,
-        includeWorkoutHistory: modules.any((module) => module.id == 'fitness'),
+        includeWorkoutHistory: selection.modules.any(
+          (module) => module.id == 'fitness',
+        ),
       );
+      if (cancelled()) return;
       final apiMessages = await memoryService.buildApiMessagesForSession(
         sessionId: sessionId,
         pendingUserText: text,
@@ -612,15 +796,15 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
             systemPrompt: AssistantPrompt.build(
               personality: ref.read(settingsProvider).personality,
               memoryContext: memoryContext,
-              moduleGuidance: AssistantModuleRegistry.guidanceFor(modules),
+              moduleGuidance: selection.guidance,
               voice: true,
             ),
-            tools: AssistantModuleRegistry.toolsFor(modules),
+            tools: selection.tools,
             onTool: (name, args) async {
               if (cancelled()) return {'error': '用户已取消'};
-              final owner = AssistantModuleRegistry.ownerOf(modules, name);
+              final owner = selection.ownerOf(name);
               if (owner?.isProposal(name) == true && proposedAction != null) {
-                return {'error': '本轮只能提出一项训练操作，请先确认或取消当前操作'};
+                return {'error': '本轮只能提出一项待确认操作，请先确认或取消当前操作'};
               }
               if (name == WebSearchModule.toolName && !searchCueSpoken) {
                 searchCueTimer?.cancel();
@@ -648,8 +832,7 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
               }
               Map<String, dynamic> result;
               try {
-                result = await AssistantModuleRegistry.invoke(
-                  modules,
+                result = await selection.invoke(
                   name,
                   args,
                   sessionId: sessionId,
@@ -807,8 +990,9 @@ class DigitalHumanNotifier extends Notifier<DigitalHumanState> {
 
   /// 打断当前语音/TTS
   void stopCurrentOutput() {
+    if (!ref.mounted) return;
     _generation++;
-    ref.read(digitalHumanTtsServiceProvider).stop();
+    unawaited(_release(_tts.stop));
     state = state.copyWith(
       isSpeaking: false,
       isProcessing: false,

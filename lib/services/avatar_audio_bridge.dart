@@ -29,14 +29,22 @@ class AvatarAudioBridge {
               .timeout(Duration(seconds: (pcm.length / 32000).ceil() + 30)) ??
           false;
     } catch (_) {
-      await stop();
+      // A replacement avatar may have attached while this request was pending.
+      // Clean up the captured view and preserve the original playback failure.
+      try {
+        await _stopChannel(channel);
+      } catch (_) {
+        // Cleanup must never replace the error that caused it.
+      }
       rethrow;
     }
   }
 
-  static Future<void> stop() async {
+  static Future<void> stop() => _stopChannel(_channel);
+
+  static Future<void> _stopChannel(MethodChannel? channel) async {
     try {
-      await _channel?.invokeMethod<void>('stopAudio');
+      await channel?.invokeMethod<void>('stopAudio');
     } on PlatformException {
       // The platform view may already be tearing down.
     } on MissingPluginException {

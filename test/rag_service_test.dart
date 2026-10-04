@@ -31,8 +31,10 @@ class _FakeVectorIndex implements RagVectorIndex {
     return [
       RagSearchResult(
         document: _doc(
-          key: 'workout:42',
-          sourceType: 'workout',
+          // A custom index owns this extension source. Managed workout sources
+          // must refer to canonical SQLite records, not a fabricated row.
+          key: 'external_note:42',
+          sourceType: 'external_note',
           title: '训练：胸部',
           content: '卧推 80kg x 5',
           embedding: [1.0, 0.0, 0.0],
@@ -198,7 +200,7 @@ void main() {
     expect(vectorIndex.capturedQueryEmbedding, [1.0, 0.0, 0.0]);
     expect(vectorIndex.capturedLimit, 3);
     expect(vectorIndex.capturedMinScore, 0.4);
-    expect(results.single.document.docKey, 'workout:42');
+    expect(results.single.document.docKey, 'external_note:42');
   });
 
   test(
