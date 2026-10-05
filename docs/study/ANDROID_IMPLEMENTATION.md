@@ -1,6 +1,6 @@
 # 拾语 Android 实现记录
 
-本分支承接网页确认资产，目标是实际 Flutter/Riverpod 原生学习应用。入口 `lib/main_study.dart`，独立 study flavor / com.namson.shiyu。网页原型仍独立保留，不用 WebView 包壳。未提交的进展不是最终 APK 验收。
+本分支承接网页确认资产，实现实际 Flutter/Riverpod 原生学习应用。入口 `lib/main_study.dart`，独立 study flavor / com.namson.shiyu。网页原型仍独立保留，不用 WebView 包壳。生产源码为 a4a140a；设备记录与后续文档提交不改变APK生产源码树。
 
 ## 有效需求 → 实现 → 验证
 
@@ -12,7 +12,7 @@
 | 个人复习、FSRS-6 | domain/review_scheduler.dart; data/fsrs_scheduler.dart | 精确锁 Dart fsrs 2.0.1，官方 FSRS-6 / 21参数。持久 card/log/model/参数/retention/evidence。Again 不保旧过期due；自动归属不由用户撤销取消 |
 | 真实计划、当日预算 | domain/study_service.dart; presentation/plan_page.dart | 上海日界线；只已到期任务入默认队列，未来列在计划中；每日总量/新学减当天消耗，保守3分钟/任务。版本冲突防覆盖 |
 | Agent 冻结对象→贡献保存→安排→撤销 | application/study_tools.dart; data/study_review_storage.dart | stable runtime tool command ID；真实 finalText 授权；事务末 cancellation lease；receipt/outbox 原子提交；撤销仅本贡献，保历史/自动任务 |
-| 双模式真实语音/数字人 | study_runtime owner; presentation/coach_page.dart | 全局 runtime；hold 取消/全屏/静音等由 native 测试；实际设备 API/ASR/DUIX 与 APK 验收记录由 native owner 补 |
+| 双模式真实语音/数字人 | study_runtime owner; presentation/coach_page.dart | 全局runtime；普通文字/按住输入、连续语音、同一个数字人全屏/收起、静音/扬声器/挂断；设备与云服务验证见下文 |
 | 考试冻结范围与分阶段评分 | data/study_exam_storage.dart; presentation/exam_page.dart | active → submitted → graded → published；未发布不暴露参考答案/成绩，进行中不允许查词/普通练习；当前真实客观中→英拼写题型 |
 | 真实统计与技能弱项 | domain/study_analytics.dart; presentation/statistics_page.dart | 实际尝试/独立/提示/忘记，真实FSRS状态计算预测；清楚标模型估计，不伪装观察到的记忆概率或长期掌握 |
 | 设置、备份/恢复 | presentation/profile_page.dart; data/study_backup_validation.dart | 正式复制备份、粘贴预览与确认恢复；schema/namespace/枚举/类型/JSON/引用校验后原子替换；非法备份保原库 |
@@ -26,22 +26,57 @@
 
 ## 当前源码验证
 
-2026-10-05，native owner 在冷启动 deadline 修复后完整 Flutter 测试实跑184通过、2个底座已有跳过项、0失败、退出码0（35秒）；此前学习 owner 全量183通过，此次增加1项 Avatar deadline 综合回归。包含真实 SQLite、学习/考试/备份界面、领域取消与幂等、语音 owner、工具播放、回执卡正式撤销元数据，以及备份 FSRS 卡步骤损坏变体（字符串、重学空步骤、负值、越界与 review 非空步骤）。全仓 `dart analyze` 无问题、退出码0；Avatar修复3文件另经native分析0问题；`git diff --check` 通过；网页保留资产的26条测试通过。此处是源码测试结果，未将它们当作模拟机验收。
+生产源码 `a4a140a403c998efa369423396a3fb0232caa8cc` 的 [PR CI](https://github.com/Namson666/ai-secretary-foundation/actions/runs/37301712675) 与 [push CI](https://github.com/Namson666/ai-secretary-foundation/actions/runs/37301709085) 均成功：ASCII checkout 标准 `flutter analyze` 0问题（10.1秒），完整测试186通过、2个底座已有跳过，公开词库计数检查通过。
 
-本机 `flutter analyze` 的 analysis server 曾出现 LSP initialize JSON 截断异常；使用同一 Flutter SDK 的 `dart analyze` 全仓分析成功，CI 仍执行标准 Flutter 分析和完整测试。最终提交与设备结果由后续验收记录绑定具体 HEAD。
+测试包含真实SQLite、学习/考试/备份界面、领域取消与幂等、语音owner、工具播放、正式撤销回执、FSRS损坏备份拒绝，以及全屏临时inactive保留通话/未发送录音取消。Avatar与Coach测试确认Hybrid Composition、同一个avatar跨全屏/收起和创建销毁配对。此前本机全仓 `dart analyze` 0问题、网页保留资产26测试通过；diff检查通过。本机 `flutter analyze` 曾遇LSP初始化截断，CI的标准Flutter分析实际通过。源码测试与设备验收分开记录；最终仅文档HEAD须另对应CI。
 
-`integration_test/study_app_journey_test.dart` 准备了真实原生 SQLite 的选词→遮挡提示→保存→重开、冻结 Agent 对象→回执→安排→撤销、考试草稿恢复→提交→评分→发布三条流程。实际设备运行结果待 native owner 补记，不能将测试文件存在或 APK 生成当成安装运行验收。禁止落盘测试截图；构建产物最多两版。
+## 实际模拟器与服务验收
 
-设备阶段使用独立 `Shiyu_Acceptance_API34`（官方API34 ARM64镜像），合并6项入口实跑5通过、1失败：DUIX就绪→真实TTS→生产VAD→云ASR→实际录音器取消、Coach全屏/收起同一avatar及播放/静音/挂断、选词遮挡Again/SQLite重开、冻结回执安排撤销、考试草稿恢复发布均通过。LLM工具项本轮遭遇服务HTTP529，界面明确报错且没有假保存；此前真实MiniMax-M3.1调用→工具收录→下一轮撤销→原生SQLite contribution inactive闭环通过，但不能替代本次整套通过，最终release还需受控复验。
+独立 `Shiyu_Acceptance_API34` 使用已有官方API34 ARM64镜像，单实例、保留userdata；没有改动health项目。最终包通过默认launcher启动，无特殊renderer intent。仅study的Skia/传统HC避免已定位的模拟器平台绘制等待，底座公共数字人和SDK保持原实现。
 
-首轮DUIX旧deadline失败定位为冷解压实测62秒，而旧计时还包含平台创建前阶段；现从真实平台创建开始计时，180秒仅是冷启动容错上限。原AVD系统服务故障不计入通过证据，原userdata未改；验收以新独立AVD为准。参考PCM用于识别/播放输入验证，实际录音器生命周期已验证，未把这些等同真人讲话验收；冷初始化与热启动时长仍分别按实际记录，不用容错上限冒充启动耗时。
+最终source a4a140a / APK 3cb2b87e 的默认release实际复验：
+
+- 黑色首页、四本核心精选、真实选词与保存后重启、中文猜英文遮挡/揭答通过。
+- 真实小秘数字人就绪，全屏系统首次“Got it”说明后通话仍保持；收起/再次全屏、静音、扬声器关闭及结束通过。结束后前台语音服务/AppOps录音使用均归零。
+- 19:34:20真实MiniMax请求调用收录工具，正式回执 `committed / pending` 表示已保存、时间尚未安排；19:36:10下一轮真实撤销成功，原卡本次贡献标已撤销，其他收录和练习历史保留。本轮无529，回执对应领域实际提交，不按模型回复猜成功。
+- 根协调者独立核对数字人全屏与回执像素、云服务错误边界；没有保存测试截图。
+
+此前合并设备入口 `integration_test/study_device_acceptance_test.dart` 的6项实跑5通过、1遇云服务HTTP529：真实DUIX/TTS/生产VAD/云ASR与录音器取消、Coach全屏收起播放，以及三条原生SQLite学习、冻结回执安排撤销、考试草稿评分发布通过；529明确报错且没有假保存。最后release的真实跨轮收录/撤销复验单独记录，不把两次运行拼成“6/6自动集成通过”。
+
+新独立AVD首次资源冷初始化：17:08:32.538开始解压，17:08:35.226复制完成，17:08:38.302实际DUIX初始化成功，约5.8秒；第二Coach热view在17:09:17.570就绪，未据单点推算热启动耗时。这是资源/数字人初始化时间，不是整个应用启动耗时。旧health AVD的62秒慢复制/system_server故障不计入产品正常时间，原userdata保留。180秒deadline只表示冷初始化容错上限。
+
+真实云ASR曾用4.60秒中英参考WAV返回HTTP200：“Hello, I'm learning English today. 今天我想练习英语。” 同一语音owner的TTS、生产VAD和实际录音器取消也经设备验证。参考PCM输入、录音器生命周期、真人讲话端到端是不同证据；实体手机和真人讲话端到端尚未验证。
 
 ## 本机构建入口
 
-已有 foundation 文档的 `lib/main_foundation.dart` / foundation flavor 构建方式保持有效；新英语产品必须明确使用独立入口和 flavor：
+已有 foundation 文档的 `lib/main_foundation.dart` / foundation flavor 构建方式保持有效；英语产品必须明确使用独立入口和flavor：
 
 ```sh
+flutter clean
+flutter pub get --enforce-lockfile
 flutter build apk --release --flavor study -t lib/main_study.dart --target-platform android-arm64
 ```
 
-该命令需要用户本机已配置的 Android/JDK、DUIX 私有资源及 MiniMax 运行配置。默认入口或仅换显示名称不能替代该产品入口。Study轻量词库与备用形象仅属于study flavor；中文离线 ASR 资源只属于foundation flavor。CI仅分析全部入口并运行可重复源码测试，不构建或上传含运行配置的APK；APK只在本地交付。
+该命令需要用户本机已配置的Android/JDK、DUIX私有资源及MiniMax运行配置。Study轻量词库与备用形象仅属于study flavor；中文离线ASR资源只属于foundation flavor。CI分析源码并运行可重复测试，不构建或上传含运行配置的APK；APK只在本地交付。
+
+## 当前工件
+
+生产源码 `a4a140a403c998efa369423396a3fb0232caa8cc`，freshclean release构建195.8秒，373737430字节（约356.4MiB），SHA256 `3cb2b87e7b4e58cc0225dfbf46e5abfdf2c516b8531a290c5daa79cef8e92a7a`。实际AOT确认 `ExpensiveAndroidViewController`、中文技能提示与云ASR；仅ARM64，manifest `EnableImpeller=false`，无integration插件与旧中文ASR权重。应用“拾语”/ `com.namson.shiyu` / `1.0.15+16`，minSdk26 / targetSdk36。
+
+最终只读审计：新boot的19:21至19:39没有am_anr，挂断后前台服务为空、RECORD_AUDIO没有running状态。停止应用后取完整数据库快照（实际无WAL/SHM，journal为0字节），integrity_check为ok；27个已选词，might已选，might发音贡献active=0且复习点cancelled，保存与撤销均有committed回执。原始本地证据为ignored的 `.gradle-build/study-hc-native-audit.txt` 与 `.gradle-build/study-hc-db-audit.json`，不上传私人数据库。
+
+本地交付为 `交付/拾语-1.0.15-arm64.apk`，绝对路径 `/Users/Namson/Documents/Codex/APP开发/english-study-web-preview/交付/拾语-1.0.15-arm64.apk`。同目录含 `SHA256.txt` 与验收说明，仅在private/ignored目录保留（目录700、文件600），不进入Git或CI artifacts。Android签名验证退出码0，目前使用Android Debug签名供本地安装测试，不是商店发布签名。
+
+最终仅保留1个APK文件/1个版本；build重复工件、旧候选、探针class/dex、临时数据库快照与预览server8766已清理。仅本项目AVD实例与其netsimd、Gradle/Kotlin闲置进程已停止，AVD userdata保留；用户4173网页预览与health工作区保留，health git clean。测试截图0。后续仅文档提交不改变上述生产源码树，不需要重新构建同一APK。
+
+## 已撤回候选与兼容修复
+
+以下候选均不交付，也不用其中局部通过结果冒充最终验收：
+
+| 候选SHA256前缀 | 实际问题 | 后续处理 |
+|---|---|---|
+| 1b6a3f698b00 | 旧AOT仍显示本地ASR，未与生产源码对齐 | 正式清理构建/Dart生成缓存、刷新插件并fresh重编；旧候选已删除 |
+| c2cd382cb381 | 默认Impeller启动33.7秒发生ANR；main停在FlutterJNI.nativeSurfaceCreated，raster停在emulator GLES/QemuPipe。软件GPU首页1560ms但AI阶段又发生5189ms输入等待 | 只对study固化Skia；不改用户其它项目 |
+| e9b84176c0ff | Skia默认包全屏后TLHC路径阻塞：main为Surface.HwuiContext.unlockAndPost/平台wrapper.draw，DUIX GL线程eglSwapBuffers/QemuPipe等待，raster空闲；降display未解决 | 只对StudyAvatar采用传统HC，review后新source a4a140a / fresh工件3cb2 |
+
+最终验收使用默认launcher与上述正式配置，不交付只能靠特殊启动intent运行的包，也不据模拟器数据推算真机性能。
