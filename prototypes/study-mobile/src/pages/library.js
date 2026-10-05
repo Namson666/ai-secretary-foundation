@@ -1,0 +1,5 @@
+import {words} from '../content.js';
+import {header,icon,go} from '../ui.js';
+export function render() {
+ return `${header('词书与资料','今天的学习，从你感兴趣的内容开始')}<form id="library-search" class="search-form"><label class="sr-only" for="word-search">搜索单词</label><input id="word-search" name="query" placeholder="搜索这本词书的单词"><button class="secondary compact">搜索</button></form><section class="book-cover"><span>DAILY ENGLISH</span><h2>日常英语<br>从生活出发。</h2><p>3 个样例词 · 手工内容 v1</p></section><div id="word-results">${words.map(w=>`<button class="word-row" data-action="open-word" data-id="${w.id}"><div><strong>${w.word}</strong><p>${w.ipa} · ${w.meaning}</p></div>${icon('arrow',18)}</button>`).join('')}</div><details class="library-material"><summary>个人材料 · 文本预览</summary><form id="material-form"><label class="field-label" for="material">粘贴包含样例词的短文</label><textarea id="material" name="material" rows="4" placeholder="The ship begins a new journey."></textarea><button class="secondary full">提取可预览的单词</button></form><p class="small-note">只匹配本页 3 个样例词，不上传文件、不导入真实词库。</p></details>${go('开始学习 '+icon('arrow',18),'learn','primary full')}`;
+}

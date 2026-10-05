@@ -1,0 +1,10 @@
+import {icon,go,section} from '../ui.js';
+export function render(state) {
+ const count=state.completed.length; const remaining=state.reviews.filter(r=>r.status!=='done'&&!r.paused).length;
+ return `<header class="home-header"><div><p class="eyebrow">MONDAY, OCT 05 · 样例日程</p><h1>今天，向前一点。</h1></div><button class="profile-button" data-route="profile" aria-label="我的学习设置">N</button></header>
+ <div class="day-summary"><span class="streak">${icon('bolt',17)} 连续 3 天 · 样例</span><span>日常英语 · A2 → B1</span></div>
+ <section class="daily-focus"><div class="focus-label">TODAY'S FOCUS <span>${state.budget} MIN</span></div><h2>先回忆，<br>再遇见新单词。</h2><p>${remaining} 项复习优先 · 3 个新词 · 1 次听辨</p><div class="progress-track"><i style="width:${Math.min(count/6*100,100)}%"></i></div><div class="progress-caption"><span>今日已练 ${count} 次</span><span>样例任务 ${Math.min(count,6)} / 6</span></div>${go(count?'继续今日学习 '+icon('arrow',18):'开始今日学习 '+icon('arrow',18),'learn','primary light')}</section>
+ <button class="quiet-row" data-action="quiet" aria-pressed="${state.quiet}"><span>${state.quiet?'静音学习':'现在方便开口'}</span><span class="toggle ${state.quiet?'':'on'}" aria-hidden="true"></span></button>
+ ${section('学习路径',go('词书与资料 '+icon('arrow',14),'library','text-button'))}<div class="path-list"><button data-route="review"><span class="path-icon mint">${icon('review')}</span><span><strong>先把记忆唤醒</strong><small>${remaining} 项待复习，优先照顾易忘内容</small></span>${icon('arrow',18)}</button><button data-route="learn"><span class="path-icon sand">${icon('book')}</span><span><strong>三个词，一点新发现</strong><small>ship · resilient · journey</small></span>${icon('arrow',18)}</button><button data-route="exam"><span class="path-icon blue">${icon('plan')}</span><span><strong>看看自己会多少</strong><small>3 题小测，先作答再看结果</small></span>${icon('arrow',18)}</button></div>
+ <section class="coach-prompt"><span class="coach-avatar" aria-hidden="true">✳</span><div><h3>你的教练，也记得下一步。</h3><p>试试说：“ship 明天练发音。”</p>${go('和教练聊聊 ↗','coach','text-button')}</div></section><p class="small-note">进度为演示练习次数，不代表掌握率。</p>`;
+}

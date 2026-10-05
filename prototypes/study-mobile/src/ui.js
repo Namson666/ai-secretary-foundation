@@ -1,0 +1,8 @@
+export const escape = value => String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const paths={home:'M3 10 12 3l9 7v10H15v-6H9v6H3Z',review:'M4 5h16v15H4ZM8 2v6m8-6v6M8 12h8m-8 4h5',plan:'M5 4h14v17H5ZM9 2h6v4H9m0 6h6m-6 4h6',coach:'M4 4h16v12h-9l-5 4v-4H4ZM8 9h.1m4 0h.1m4 0h.1',user:'M16 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0M4 21v-2a8 8 0 0 1 16 0v2',arrow:'m9 5 7 7-7 7',back:'m15 5-7 7 7 7',audio:'M4 9h4l5-4v14l-5-4H4Zm12-2a8 8 0 0 1 0 10m3-13a12 12 0 0 1 0 16',mic:'M9 4a3 3 0 0 1 6 0v8a3 3 0 0 1-6 0ZM5 10v2a7 7 0 0 0 14 0v-2m-7 9v3m-4 0h8',check:'m5 12 4 4L20 5',book:'M3 4h7l2 2 2-2h7v16h-7l-2 2-2-2H3Zm9 2v16',bolt:'m13 2-9 12h7l-1 8 10-13h-7Z',close:'m6 6 12 12M6 18 18 6'};
+export const icon=(name,size=22)=>`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${paths[name]??paths.arrow}"/></svg>`;
+export const go=(label,route,cls='primary',extra='')=>`<button class="${cls}" data-route="${route}" ${extra}>${label}</button>`;
+export const header=(title,subtitle='',back='home')=>`<header class="page-header"><button class="icon-button" data-route="${back}" aria-label="返回">${icon('back')}</button><div><h1>${title}</h1>${subtitle?`<p>${subtitle}</p>`:''}</div></header>`;
+export const section=(title,action='')=>`<div class="section-heading"><h2>${title}</h2>${action}</div>`;
+export function toast(message) {const el=document.querySelector('#toast');el.textContent=message;el.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.remove('show'),3200);}
+export const notice=()=>'<p class="small-note">演示记录仅保存在此浏览器，不代表真实学习提交。</p>';
