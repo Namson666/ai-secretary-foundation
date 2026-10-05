@@ -13,13 +13,20 @@ void main() {
       final createGate = Completer<void>();
       final ids = <int>[];
       var ready = 0;
+      final disposed = <int>[];
       messenger.setMockMethodCallHandler(SystemChannels.platform_views, (
         call,
       ) async {
         if (call.method == 'create') {
-          ids.add((call.arguments as Map)['id'] as int);
+          final args = call.arguments as Map;
+          expect(args['hybrid'], true);
+          expect(args.containsKey('width'), false);
+          ids.add(args['id'] as int);
           if (ids.length == 1) await createGate.future;
           return 1;
+        }
+        if (call.method == 'dispose') {
+          disposed.add((call.arguments as Map)['id'] as int);
         }
         if (call.method == 'resize') return {'width': 360.0, 'height': 250.0};
         return null;
@@ -64,6 +71,8 @@ void main() {
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pump(const Duration(seconds: 181));
       expect(tester.takeException(), isNull);
+      expect(disposed.toSet(), ids.toSet());
+      expect(disposed.length, ids.length);
     },
   );
 }

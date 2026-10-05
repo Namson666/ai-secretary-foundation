@@ -21,6 +21,7 @@ void main() {
         call,
       ) async {
         if (call.method == 'create') {
+          expect((call.arguments as Map)['hybrid'], true);
           creates++;
           return creates;
         }
@@ -56,6 +57,7 @@ void main() {
       expect(runtime.callActive, true);
       final state = tester.state(find.byType(StudyAvatar));
       final before = creates;
+      expect(before, greaterThan(0));
       await tester.tap(find.byTooltip('数字人全屏'));
       await tester.pump();
       expect(find.byType(StudyAvatar), findsOneWidget);
@@ -79,7 +81,7 @@ void main() {
       await tester.pump();
       await runtime.close();
       runtime.dispose();
-      expect(disposes, lessThanOrEqualTo(creates));
+      expect(disposes, creates);
     },
   );
 }

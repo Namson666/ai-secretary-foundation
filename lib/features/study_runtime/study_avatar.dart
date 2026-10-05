@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/rendering.dart';
 
 import '../../services/avatar_audio_bridge.dart';
 
@@ -50,6 +51,35 @@ class _StudyAvatarState extends State<StudyAvatar> {
     widget.onError?.call(error);
   }
 
+  void _onViewCreated(int id, int epoch) {
+    if (!mounted || _error != null || epoch != _viewEpoch) return;
+    final channel = MethodChannel('com.namson.ai_secretary/duix_view_$id');
+    _channel = channel;
+    // Cold resource extraction is part of native initialization.
+    // Start the bounded wait once the platform view actually exists.
+    _deadline = Timer(const Duration(seconds: 180), () {
+      if (mounted && !_ready && identical(_channel, channel)) {
+        _failed('数字人初始化超时，文字与普通语音仍可用');
+      }
+    });
+    channel.setMethodCallHandler((call) async {
+      if (!mounted || _error != null || !identical(_channel, channel)) {
+        return;
+      }
+      if (call.method == 'onDuixInitialized') {
+        _deadline?.cancel();
+        AvatarAudioBridge.attach(channel);
+        setState(() {
+          _ready = true;
+          _error = null;
+        });
+        widget.onReady?.call();
+      } else if (call.method == 'onDuixError') {
+        _failed('数字人加载失败，文字与普通语音仍可用');
+      }
+    });
+  }
+
   @override
   void didUpdateWidget(StudyAvatar oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -87,42 +117,29 @@ class _StudyAvatarState extends State<StudyAvatar> {
               const Center(child: Icon(Icons.person, size: 96)),
         ),
         if (_error == null)
-          AndroidView(
+          // DUIX owns an EGL TextureView. HC keeps it in the Android view
+          // hierarchy and avoids the Flutter texture canvas/fence copy path.
+          PlatformViewLink(
             key: ValueKey(epoch),
             viewType: 'com.namson.ai_secretary/duix_view',
-            creationParams: const {'modelPath': '小秘'},
-            creationParamsCodec: const StandardMessageCodec(),
-            onPlatformViewCreated: (id) {
-              if (!mounted || _error != null || epoch != _viewEpoch) return;
-              final channel = MethodChannel(
-                'com.namson.ai_secretary/duix_view_$id',
-              );
-              _channel = channel;
-              // Cold resource extraction is part of native initialization.
-              // Start the bounded wait once the platform view actually exists.
-              _deadline = Timer(const Duration(seconds: 180), () {
-                if (mounted && !_ready && identical(_channel, channel)) {
-                  _failed('数字人初始化超时，文字与普通语音仍可用');
-                }
-              });
-              channel.setMethodCallHandler((call) async {
-                if (!mounted ||
-                    _error != null ||
-                    !identical(_channel, channel)) {
-                  return;
-                }
-                if (call.method == 'onDuixInitialized') {
-                  _deadline?.cancel();
-                  AvatarAudioBridge.attach(channel);
-                  setState(() {
-                    _ready = true;
-                    _error = null;
-                  });
-                  widget.onReady?.call();
-                } else if (call.method == 'onDuixError') {
-                  _failed('数字人加载失败，文字与普通语音仍可用');
-                }
-              });
+            surfaceFactory: (context, controller) => AndroidViewSurface(
+              controller: controller as AndroidViewController,
+              gestureRecognizers: const {},
+              hitTestBehavior: PlatformViewHitTestBehavior.opaque,
+            ),
+            onCreatePlatformView: (params) {
+              return PlatformViewsService.initExpensiveAndroidView(
+                  id: params.id,
+                  viewType: params.viewType,
+                  layoutDirection: Directionality.of(context),
+                  creationParams: const {'modelPath': '小秘'},
+                  creationParamsCodec: const StandardMessageCodec(),
+                  onFocus: () => params.onFocusChanged(true),
+                )
+                ..addOnPlatformViewCreatedListener(params.onPlatformViewCreated)
+                ..addOnPlatformViewCreatedListener(
+                  (id) => _onViewCreated(id, epoch),
+                );
             },
           ),
         if (!_ready)
