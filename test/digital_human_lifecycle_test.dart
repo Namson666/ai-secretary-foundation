@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:ai_secretary/core/database/database_helper.dart';
 import 'package:ai_secretary/providers/digital_human_provider.dart';
@@ -39,6 +40,7 @@ class _LocalAsr extends LocalStreamingAsrService {
     required PartialTranscript onPartial,
     required PartialTranscript onUtterance,
     required void Function() onSpeechStart,
+    void Function(Uint8List)? onPcm,
   }) async {
     conversationStarts++;
     partial = onPartial;
