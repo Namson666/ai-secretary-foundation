@@ -24,6 +24,7 @@ class LocalStreamingAsrService {
   PartialTranscript? _onPartial;
   PartialTranscript? _onUtterance;
   void Function()? _onSpeechStart;
+  void Function(Uint8List)? _onPcm;
   bool _continuous = false;
   Object? _workerError;
   bool _active = false;
@@ -132,10 +133,12 @@ class LocalStreamingAsrService {
     required PartialTranscript onPartial,
     required PartialTranscript onUtterance,
     required void Function() onSpeechStart,
+    void Function(Uint8List)? onPcm,
   }) {
     _continuous = true;
     _onUtterance = onUtterance;
     _onSpeechStart = onSpeechStart;
+    _onPcm = onPcm;
     return start(onPartial);
   }
 
@@ -167,7 +170,10 @@ class LocalStreamingAsrService {
       );
       _recordingStarted = true;
       _audioSubscription = audio.listen(
-        (chunk) => _commands?.send(['audio', chunk]),
+        (chunk) {
+          if (_active && !_cancelled && !_ending) _onPcm?.call(chunk);
+          _commands?.send(['audio', chunk]);
+        },
         onError: (Object error) {
           final completer = _finalText;
           if (completer != null && !completer.isCompleted) {
@@ -201,6 +207,7 @@ class LocalStreamingAsrService {
       _onPartial = null;
       _onUtterance = null;
       _onSpeechStart = null;
+      _onPcm = null;
       _continuous = false;
       _finalText = null;
     }
@@ -211,6 +218,7 @@ class LocalStreamingAsrService {
     _onPartial = null;
     _onUtterance = null;
     _onSpeechStart = null;
+    _onPcm = null;
     _continuous = false;
     try {
       await _starting;

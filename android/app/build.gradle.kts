@@ -128,6 +128,18 @@ android {
             applicationIdSuffix = ".foundation"
             manifestPlaceholders["appLabel"] = "数字人底座"
         }
+        create("study") {
+            dimension = "edition"
+            applicationId = "com.namson.shiyu"
+            manifestPlaceholders["appLabel"] = "拾语"
+            ndk { abiFilters += "arm64-v8a" }
+            // Study currently needs only MiniMax conversation/ASR/TTS. Never bundle
+            // unrelated credentials from the reused local health configuration.
+            listOf("DEEPSEEK_KEY", "TENCENT_SECRET_ID", "TENCENT_SECRET_KEY",
+                "BAILIAN_WORKSPACE_ID", "BAILIAN_API_KEY").forEach {
+                buildConfigField("String", it, "\"\"")
+            }
+        }
     }
 
     signingConfigs {
@@ -149,6 +161,16 @@ android {
                 signingConfigs.getByName("debug")
             }
         }
+    }
+}
+
+// Flutter and transitive FFI plugins can contribute extra native ABIs even when
+// --target-platform is ARM64. Keep this delivery aligned with the bundled DUIX SDK.
+androidComponents {
+    onVariants(selector().withFlavor("edition" to "study")) { variant ->
+        variant.packaging.jniLibs.excludes.addAll(
+            setOf("lib/armeabi-v7a/**", "lib/x86/**", "lib/x86_64/**")
+        )
     }
 }
 

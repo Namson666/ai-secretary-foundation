@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:ai_secretary/core/app_profile.dart';
 import 'package:ai_secretary/core/assistant/assistant_context.dart';
@@ -129,6 +130,7 @@ class _InputAsr extends LocalStreamingAsrService {
     required PartialTranscript onPartial,
     required PartialTranscript onUtterance,
     required void Function() onSpeechStart,
+    void Function(Uint8List)? onPcm,
   }) async {
     speechStart = onSpeechStart;
     utterance = onUtterance;

@@ -78,6 +78,9 @@ class DuixPlatformView(
                 }
             }
         }
+        duixView.onInitError = {
+            methodChannel.invokeMethod("onDuixError", "数字人初始化失败，仍可使用文字和语音")
+        }
         container = FrameLayout(context).apply {
             addView(duixView, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -195,6 +198,7 @@ class DuixPlatformView(
     override fun dispose() {
         Log.d(TAG, "dispose DuixPlatformView")
         duixView.onAudioEvent = null
+        duixView.onInitError = null
         audioResult?.success(false)
         audioResult = null
         try { duix?.release() } catch (e: Throwable) { Log.e(TAG, "release failed", e) }
@@ -212,6 +216,7 @@ class DuixTextureView(
     private val onInitialized: (DUIX?) -> Unit
 ) : DUIXTextureView(context) {
     var onAudioEvent: ((String) -> Unit)? = null
+    var onInitError: (() -> Unit)? = null
 
     private var pendingSurface: SurfaceTexture? = null
     private var pendingWidth = 0
@@ -372,6 +377,7 @@ class DuixTextureView(
                                 retryInit()
                             } else {
                                 Log.e(TAG, "DUIX init error is not retryable; keeping fallback avatar")
+                                onInitError?.invoke()
                             }
                         }
                     }
@@ -413,6 +419,7 @@ class DuixTextureView(
             }, delay.toLong())
         } else {
             Log.e(TAG, "DUIX init failed after 10 retries")
+            onInitError?.invoke()
         }
     }
 
