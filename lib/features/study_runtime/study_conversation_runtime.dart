@@ -594,7 +594,15 @@ class StudyConversationRuntime extends ChangeNotifier
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state != AppLifecycleState.resumed) {
+    // System overlays (including the first immersive-mode explanation) can
+    // temporarily remove window focus without putting the app in background.
+    if (state == AppLifecycleState.inactive) {
+      if (phase == StudyConversationPhase.recording) unawaited(cancelHold());
+      return;
+    }
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached) {
       if (callActive) {
         unawaited(endCall());
       } else {

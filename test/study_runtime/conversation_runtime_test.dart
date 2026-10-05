@@ -6,6 +6,7 @@ import 'package:ai_secretary/features/study_runtime/study_conversation_runtime.d
 import 'package:ai_secretary/services/local_streaming_asr_service.dart';
 import 'package:ai_secretary/services/tts_service.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 class TestAsr extends LocalStreamingAsrService {
@@ -93,6 +94,63 @@ void main() {
   setUp(() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (_) async => null);
+  });
+
+  test(
+    'temporary inactive preserves the call; background releases it',
+    () async {
+      final asr = TestAsr();
+      final runtime = StudyConversationRuntime(
+        asr: asr,
+        cloud: TestCloud(),
+        tts: TestTts(),
+      );
+      await runtime.startCall();
+      await runtime.setMuted(true);
+      await runtime.setSpeaker(false);
+      runtime.elapsed = const Duration(seconds: 17);
+      final cancellations = asr.stop.length;
+
+      runtime.didChangeAppLifecycleState(AppLifecycleState.inactive);
+      await Future<void>.delayed(Duration.zero);
+      runtime.didChangeAppLifecycleState(AppLifecycleState.resumed);
+      expect(runtime.callActive, true);
+      expect(runtime.muted, true);
+      expect(runtime.speakerEnabled, false);
+      expect(runtime.elapsed, const Duration(seconds: 17));
+      expect(asr.stop.length, cancellations);
+      expect(asr.listens, 1);
+
+      runtime.didChangeAppLifecycleState(AppLifecycleState.paused);
+      await Future<void>.delayed(Duration.zero);
+      expect(runtime.callActive, false);
+      expect(asr.stop.length, greaterThan(cancellations));
+      runtime.didChangeAppLifecycleState(AppLifecycleState.resumed);
+      expect(runtime.callActive, false);
+      await runtime.close();
+      runtime.dispose();
+    },
+  );
+
+  test('temporary inactive discards an unsent held recording', () async {
+    final asr = TestAsr();
+    final cloud = TestCloud();
+    final runtime = StudyConversationRuntime(
+      asr: asr,
+      cloud: cloud,
+      tts: TestTts(),
+    );
+    await runtime.startHold();
+    runtime.didChangeAppLifecycleState(AppLifecycleState.inactive);
+    await Future<void>.delayed(Duration.zero);
+    runtime.didChangeAppLifecycleState(AppLifecycleState.resumed);
+    await runtime.finishHold();
+    expect(runtime.phase, StudyConversationPhase.idle);
+    expect(asr.stop, contains('cancel'));
+    expect(cloud.captures, isEmpty);
+    expect(runtime.messages, isEmpty);
+    await runtime.close();
+    runtime.dispose();
   });
 
   test('hold input keeps word A through later screen switch to B', () async {
