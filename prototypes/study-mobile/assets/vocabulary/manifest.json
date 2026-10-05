@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "source": {
+    "id": "ecdict",
+    "title": "ECDICT 开源英汉词典",
+    "url": "https://github.com/skywind3000/ECDICT",
+    "license": "MIT",
+    "version": "bc015ed2e24a7abef49fc6dbbb7fe32c1dadaf8b",
+    "attribution": "ECDICT / skywind3000; MIT notice: Copyright (c) 2025 Linwei",
+    "retrievedAt": "2026-10-05",
+    "dataUrl": "https://raw.githubusercontent.com/skywind3000/ECDICT/bc015ed2e24a7abef49fc6dbbb7fe32c1dadaf8b/ecdict.csv"
+  },
+  "sourceBytes": 65933428,
+  "sourceGitBlobSha1": "c4ade63ea08cf39d9c3475e96929036d64d94c94",
+  "sourceSha256": "1a6947e04785db63613a92e14903cdae7954f7e84860b10e68e5c7cbb3f9c3cf",
+  "rawRowsRead": 770611,
+  "rawExamTagCounts": {
+    "gk": 3677,
+    "cet4": 3849,
+    "cet6": 5407
+  },
+  "excludedWordOrTranslationRows": 372178,
+  "criteria": {
+    "headwords": "lowercase ASCII letters with internal hyphen or apostrophe; nonempty Chinese translation",
+    "rank": "positive frq, else positive bnc, else absent rank",
+    "selection": "daily 1000, gk/cet4/cet6 1500 each; frequency then headword"
+  },
+  "uniqueWordCount": 2468,
+  "bookCounts": {
+    "daily": 1000,
+    "highschool": 1500,
+    "cet4": 1500,
+    "cet6": 1500
+  },
+  "emptyIpaCount": 8,
+  "sourceExamples": 0,
+  "moduleBytes": 1338907,
+  "moduleSha256": "90f6f2734d015f0330bf6b4f60abab10e64e3b1a362b4756100bdeafd14ee100"
+}
